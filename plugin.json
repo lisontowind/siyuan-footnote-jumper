@@ -1,0 +1,60 @@
+{
+  "name": "siyuan-footnote-jumper",
+  "author": "lisontowind",
+  "url": "https://github.com/lisontowind/siyuan-footnote-jumper",
+  "version": "0.1.0",
+  "minAppVersion": "3.7.0",
+  "kernels": [
+    "windows",
+    "linux",
+    "darwin",
+    "ios",
+    "android",
+    "harmony",
+    "docker",
+    "all"
+  ],
+  "backends": [
+    "windows",
+    "linux",
+    "darwin",
+    "ios",
+    "android",
+    "harmony",
+    "docker",
+    "all"
+  ],
+  "frontends": [
+    "desktop",
+    "mobile",
+    "browser-desktop",
+    "browser-mobile",
+    "desktop-window",
+    "all"
+  ],
+  "disabledInPublish": false,
+  "displayName": {
+    "default": "Footnote Jumper",
+    "zh-CN": "脚注跳转"
+  },
+  "description": {
+    "default": "Display Markdown-style footnote references as clickable links without changing note data.",
+    "zh-CN": "在不修改笔记数据的情况下，将 Markdown 脚注引用显示为可点击跳转。"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh-CN": "README.md"
+  },
+  "funding": {
+    "openCollective": "",
+    "patreon": "",
+    "github": "",
+    "custom": []
+  },
+  "keywords": [
+    "footnote",
+    "脚注",
+    "typora",
+    "markdown"
+  ]
+}

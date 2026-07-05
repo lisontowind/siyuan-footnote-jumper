@@ -1,0 +1,79 @@
+.siyuan-footnote-topbar--enabled {
+    color: var(--b3-theme-primary);
+}
+
+.siyuan-footnote-ref {
+    position: relative;
+    display: inline-block;
+    padding: 0 1px;
+    color: var(--b3-theme-primary);
+    border-bottom: 1px dotted currentcolor;
+    cursor: pointer;
+    font-size: 0.82em;
+    font-weight: 600;
+    line-height: 1;
+    vertical-align: super;
+}
+
+.siyuan-footnote-ref:hover {
+    background: var(--b3-theme-primary-lightest);
+    border-radius: 3px;
+}
+
+.siyuan-footnote-ref--missing {
+    color: var(--b3-theme-error);
+}
+
+.siyuan-footnote-tooltip {
+    position: fixed;
+    z-index: 2147483647;
+    top: 0;
+    left: 0;
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(420px, calc(100vw - 24px));
+    max-height: min(260px, calc(100vh - 24px));
+    overflow: auto;
+    padding: 8px 10px;
+    color: var(--b3-theme-on-background);
+    background: var(--b3-theme-surface);
+    border: 1px solid var(--b3-theme-surface-lighter);
+    border-radius: 6px;
+    box-shadow: var(--b3-dialog-shadow);
+    font-size: 12px;
+    line-height: 1.5;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(2px);
+    transition: opacity 120ms ease, transform 120ms ease;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.siyuan-footnote-tooltip--visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.siyuan-footnote-definition {
+    border-left: 2px solid var(--b3-theme-primary-light);
+}
+
+.siyuan-footnote-definition .p,
+.siyuan-footnote-definition [contenteditable="true"] {
+    color: var(--b3-theme-on-surface);
+}
+
+.siyuan-footnote-definition--highlight {
+    animation: siyuan-footnote-highlight 1800ms ease-out;
+}
+
+@keyframes siyuan-footnote-highlight {
+    0% {
+        background: var(--b3-theme-primary-lightest);
+    }
+
+    100% {
+        background: transparent;
+    }
+}
