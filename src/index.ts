@@ -1,4 +1,4 @@
-import {Menu, Plugin, showMessage} from "siyuan";
+import {confirm, getActiveEditor, IOperation, Menu, Plugin, showMessage} from "siyuan";
 import "./index.scss";
 
 const STORAGE_NAME = "footnote-jumper-settings";
@@ -9,6 +9,7 @@ const HIGHLIGHT_CLASS = "siyuan-footnote-definition--highlight";
 const MISSING_CLASS = "siyuan-footnote-ref--missing";
 const TOOLTIP_CLASS = "siyuan-footnote-tooltip";
 const TOOLTIP_VISIBLE_CLASS = "siyuan-footnote-tooltip--visible";
+const NATIVE_BLOCK_REF_TYPE = "block-ref";
 const ACTIVE_REFRESH_DELAY = 1000;
 const INACTIVE_REFRESH_DELAY = 200;
 
@@ -26,6 +27,11 @@ interface FootnoteDefinition {
 interface SelectionBookmark {
     start: number;
     end: number;
+}
+
+interface NativeBlockRefUpdate {
+    operation: IOperation;
+    referenceCount: number;
 }
 
 export default class FootnoteJumperPlugin extends Plugin {
@@ -46,6 +52,7 @@ export default class FootnoteJumperPlugin extends Plugin {
     private activeBlockId?: string;
     private tooltipElement?: HTMLElement;
     private activeTooltipRef?: HTMLElement;
+    private isAddingNativeBlockRefs = false;
 
     private readonly handleDocumentClick = (event: MouseEvent) => {
         if (!this.enabled) {
@@ -317,6 +324,15 @@ export default class FootnoteJumperPlugin extends Plugin {
                 this.setLiveRefreshEditingBlock(!this.liveRefreshEditingBlock);
             },
         });
+        menu.addSeparator();
+        menu.addItem({
+            label: "为脚注标记添加块引",
+            icon: "iconLink",
+            disabled: this.isAddingNativeBlockRefs,
+            click: () => {
+                this.confirmAddNativeBlockRefs();
+            },
+        });
 
         const rect = this.topBarElement?.getBoundingClientRect();
         menu.open({
@@ -375,6 +391,177 @@ export default class FootnoteJumperPlugin extends Plugin {
         } else {
             this.activeRefreshAt = 0;
         }
+    }
+
+    private confirmAddNativeBlockRefs() {
+        const editor = getActiveEditor();
+        const wysiwyg = editor?.protyle?.wysiwyg?.element;
+        const rootId = editor?.protyle?.block?.rootID;
+        if (!wysiwyg || !rootId) {
+            showMessage("请先打开需要处理的文档", 3000, "error");
+            return;
+        }
+
+        const updates = this.prepareNativeBlockRefUpdates(wysiwyg);
+        const referenceCount = updates.reduce((count, update) => count + update.referenceCount, 0);
+        if (referenceCount === 0) {
+            showMessage("当前文档中没有可添加块引的脚注标记");
+            return;
+        }
+
+        confirm(
+            "为脚注标记添加块引",
+            `将在当前文档中把 ${referenceCount} 个脚注标记替换为指向脚注定义块的静态块引用，`
+                + "从而启用思源原生的悬浮预览。<br><br>此操作会修改笔记内容，但可以使用撤销恢复。是否继续？",
+            () => {
+                this.addNativeBlockRefs(rootId);
+            },
+        );
+    }
+
+    private addNativeBlockRefs(expectedRootId: string) {
+        if (this.isAddingNativeBlockRefs) {
+            return;
+        }
+
+        const editor = getActiveEditor();
+        const wysiwyg = editor?.protyle?.wysiwyg?.element;
+        if (!wysiwyg || editor.protyle.block.rootID !== expectedRootId) {
+            showMessage("当前文档已切换，请重新执行该操作", 4000, "error");
+            return;
+        }
+
+        const updates = this.prepareNativeBlockRefUpdates(wysiwyg);
+        const referenceCount = updates.reduce((count, update) => count + update.referenceCount, 0);
+        if (updates.length === 0 || referenceCount === 0) {
+            showMessage("没有找到仍需添加块引的脚注标记");
+            return;
+        }
+
+        this.isAddingNativeBlockRefs = true;
+        try {
+            editor.transaction(updates.map((update) => update.operation));
+            showMessage(`已为 ${referenceCount} 个脚注标记添加块引`);
+        } catch (error) {
+            console.error(`[${this.name}] add native block refs failed`, error);
+            showMessage("添加脚注块引失败，请查看日志", 5000, "error");
+        } finally {
+            this.isAddingNativeBlockRefs = false;
+        }
+    }
+
+    private prepareNativeBlockRefUpdates(wysiwyg: HTMLElement) {
+        const definitions = this.collectDefinitions(wysiwyg);
+        const updates: NativeBlockRefUpdate[] = [];
+
+        for (const block of Array.from(wysiwyg.querySelectorAll<HTMLElement>("[data-node-id]"))) {
+            const blockId = block.dataset.nodeId;
+            if (!blockId || Array.from(definitions.values()).some((definition) => definition.element === block)) {
+                continue;
+            }
+
+            const clone = block.cloneNode(true) as HTMLElement;
+            const referenceCount = this.convertFootnoteMarkersToNativeRefs(clone, definitions);
+            if (referenceCount === 0) {
+                continue;
+            }
+
+            updates.push({
+                operation: {
+                    action: "update",
+                    id: blockId,
+                    data: clone.outerHTML,
+                },
+                referenceCount,
+            });
+        }
+
+        return updates;
+    }
+
+    private convertFootnoteMarkersToNativeRefs(
+        block: HTMLElement,
+        definitions: Map<string, FootnoteDefinition>,
+    ) {
+        let referenceCount = 0;
+        const enhancedRefs = Array.from(block.querySelectorAll<HTMLElement>(`.${REF_CLASS}[data-footnote-id]`))
+            .filter((reference) => reference.closest("[data-node-id]") === block);
+
+        for (const reference of enhancedRefs) {
+            const id = reference.dataset.footnoteId;
+            const definitionBlockId = id ? definitions.get(id)?.element.dataset.nodeId : undefined;
+            if (!id || !definitionBlockId) {
+                continue;
+            }
+
+            reference.replaceWith(this.createNativeBlockRef(id, definitionBlockId));
+            referenceCount += 1;
+        }
+
+        const textNodes: Text[] = [];
+        const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+            acceptNode: (node) => {
+                if (!(node.textContent || "").includes("[^")) {
+                    return NodeFilter.FILTER_REJECT;
+                }
+
+                const parent = node.parentElement;
+                if (!parent
+                    || parent.closest(`[data-type~="${NATIVE_BLOCK_REF_TYPE}"], [data-type~="code"], code, pre, style, script, textarea, input`)
+                    || parent.closest("[data-node-id]") !== block) {
+                    return NodeFilter.FILTER_REJECT;
+                }
+
+                return NodeFilter.FILTER_ACCEPT;
+            },
+        });
+
+        while (walker.nextNode()) {
+            textNodes.push(walker.currentNode as Text);
+        }
+
+        for (const textNode of textNodes) {
+            const text = textNode.nodeValue || "";
+            const regex = /\[\^([^\]\s:]+)\]/g;
+            let match: RegExpExecArray | null;
+            let lastIndex = 0;
+            let changed = false;
+            const fragment = document.createDocumentFragment();
+
+            while ((match = regex.exec(text)) !== null) {
+                const definitionBlockId = definitions.get(match[1])?.element.dataset.nodeId;
+                if (!definitionBlockId) {
+                    continue;
+                }
+
+                changed = true;
+                if (match.index > lastIndex) {
+                    fragment.append(document.createTextNode(text.slice(lastIndex, match.index)));
+                }
+                fragment.append(this.createNativeBlockRef(match[1], definitionBlockId));
+                lastIndex = match.index + match[0].length;
+                referenceCount += 1;
+            }
+
+            if (!changed) {
+                continue;
+            }
+            if (lastIndex < text.length) {
+                fragment.append(document.createTextNode(text.slice(lastIndex)));
+            }
+            textNode.replaceWith(fragment);
+        }
+
+        return referenceCount;
+    }
+
+    private createNativeBlockRef(id: string, definitionBlockId: string) {
+        const reference = document.createElement("span");
+        reference.dataset.type = NATIVE_BLOCK_REF_TYPE;
+        reference.dataset.subtype = "s";
+        reference.dataset.id = definitionBlockId;
+        reference.textContent = `[^${id}]`;
+        return reference;
     }
 
     private updateTopBarState() {
@@ -833,7 +1020,7 @@ export default class FootnoteJumperPlugin extends Plugin {
             return NodeFilter.FILTER_REJECT;
         }
 
-        if (parent.closest(`.${REF_CLASS}, .${DEF_CLASS}, [${ENHANCED_ATTR}], style, script, textarea, input`)) {
+        if (parent.closest(`.${REF_CLASS}, .${DEF_CLASS}, [${ENHANCED_ATTR}], [data-type~="${NATIVE_BLOCK_REF_TYPE}"], [data-type~="code"], code, pre, style, script, textarea, input`)) {
             return NodeFilter.FILTER_REJECT;
         }
 

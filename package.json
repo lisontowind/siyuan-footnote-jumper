@@ -1,7 +1,7 @@
 {
   "name": "siyuan-footnote-jumper",
-  "version": "0.1.2",
-  "description": "A SiYuan plugin that makes Markdown footnote references clickable without changing note data.",
+  "version": "0.1.3",
+  "description": "A SiYuan plugin for clickable Markdown footnotes and optional native block-reference previews.",
   "main": "index.js",
   "scripts": {
     "dev": "webpack --config webpack.config.js --mode development",

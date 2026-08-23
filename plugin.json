@@ -2,7 +2,7 @@
   "name": "siyuan-footnote-jumper",
   "author": "lisontowind",
   "url": "https://github.com/lisontowind/siyuan-footnote-jumper",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "minAppVersion": "3.7.0",
   "kernels": [
     "all"
@@ -19,8 +19,8 @@
     "zh-CN": "脚注跳转"
   },
   "description": {
-    "default": "Display Markdown-style footnote references as clickable links without changing note data.",
-    "zh-CN": "在不修改笔记数据的情况下，将 Markdown 脚注引用显示为可点击跳转。"
+    "default": "Enhance Markdown footnotes with clickable jumps and optional native block-reference previews.",
+    "zh-CN": "为 Markdown 脚注提供点击跳转，并可按需转换为思源原生块引用预览。"
   },
   "readme": {
     "default": "README.md",
