@@ -1,4 +1,5 @@
-import {confirm, getActiveEditor, IOperation, Menu, Plugin, showMessage} from "siyuan";
+import {confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Menu, openMobileFileById, openTab, Plugin, showMessage} from "siyuan";
+import {parseDefinition, readDocumentDefinitions, StoredDefinition} from "./definitions";
 import "./index.scss";
 
 const STORAGE_NAME = "footnote-jumper-settings";
@@ -9,19 +10,25 @@ const HIGHLIGHT_CLASS = "siyuan-footnote-definition--highlight";
 const MISSING_CLASS = "siyuan-footnote-ref--missing";
 const TOOLTIP_CLASS = "siyuan-footnote-tooltip";
 const TOOLTIP_VISIBLE_CLASS = "siyuan-footnote-tooltip--visible";
+const RETURN_BUTTON_CLASS = "siyuan-footnote-return";
 const NATIVE_BLOCK_REF_TYPE = "block-ref";
 const ACTIVE_REFRESH_DELAY = 1000;
 const INACTIVE_REFRESH_DELAY = 200;
+const TOOLTIP_HIDE_DELAY = 300;
 
 interface FootnoteSettings {
     enabled: boolean;
     liveRefreshEditingBlock: boolean;
 }
 
-interface FootnoteDefinition {
-    id: string;
-    content: string;
-    element: HTMLElement;
+interface FootnoteDefinition extends StoredDefinition {
+    element?: HTMLElement;
+}
+
+interface DocumentDefinitions {
+    definitions: Map<string, StoredDefinition>;
+    expiresAt: number;
+    loading?: Promise<void>;
 }
 
 interface SelectionBookmark {
@@ -32,6 +39,13 @@ interface SelectionBookmark {
 interface NativeBlockRefUpdate {
     operation: IOperation;
     referenceCount: number;
+}
+
+interface FootnoteOrigin {
+    rootId: string;
+    blockId: string;
+    footnoteId: string;
+    referenceIndex: number;
 }
 
 export default class FootnoteJumperPlugin extends Plugin {
@@ -45,13 +59,20 @@ export default class FootnoteJumperPlugin extends Plugin {
     private isRendering = false;
     private isComposing = false;
     private suppressSelectionSync = false;
-    private definitions = new Map<string, FootnoteDefinition>();
+    private editorProtyles = new WeakMap<HTMLElement, IProtyle>();
+    private documentDefinitions = new Map<string, DocumentDefinitions>();
+    private definitionRefreshAfter = 0;
+    private unloaded = false;
     private definitionSignatures = new WeakMap<HTMLElement, string>();
     private dirtyBlocks = new Set<HTMLElement>();
     private activeBlock?: HTMLElement;
     private activeBlockId?: string;
     private tooltipElement?: HTMLElement;
     private activeTooltipRef?: HTMLElement;
+    private tooltipHideTimer = 0;
+    private tooltipInteracting = false;
+    private returnOrigin?: FootnoteOrigin;
+    private returnButton?: HTMLButtonElement;
     private isAddingNativeBlockRefs = false;
 
     private readonly handleDocumentClick = (event: MouseEvent) => {
@@ -60,6 +81,12 @@ export default class FootnoteJumperPlugin extends Plugin {
         }
 
         const target = event.target as HTMLElement;
+        if (this.isReturnButtonTarget(target)) {
+            event.preventDefault();
+            event.stopPropagation();
+            void this.returnToReference();
+            return;
+        }
         const refElement = target?.closest?.(`.${REF_CLASS}`) as HTMLElement;
         if (!refElement) {
             return;
@@ -70,22 +97,31 @@ export default class FootnoteJumperPlugin extends Plugin {
             return;
         }
 
-        const definition = this.findDefinition(id, refElement);
-        if (!definition) {
-            showMessage(`未找到脚注 [^${id}] 的定义`);
-            return;
-        }
-
         event.preventDefault();
         event.stopPropagation();
+        void this.jumpToDefinition(id, refElement);
+    };
 
-        definition.element.scrollIntoView({
-            behavior: "smooth",
-            block: "center",
-        });
-        definition.element.classList.remove(HIGHLIGHT_CLASS);
-        window.setTimeout(() => definition.element.classList.add(HIGHLIGHT_CLASS), 30);
-        window.setTimeout(() => definition.element.classList.remove(HIGHLIGHT_CLASS), 1800);
+    private readonly handleProtyleLoaded = (event: CustomEvent<{protyle: IProtyle}>) => {
+        const protyle = event.detail.protyle;
+        this.registerEditor(protyle);
+        if (this.enabled && protyle.wysiwyg?.element) {
+            this.markEditorDirty(protyle.wysiwyg.element);
+            this.scheduleRefresh(50);
+        }
+    };
+
+    private readonly handleKernelMessage = (event: CustomEvent<{cmd: string}>) => {
+        if (["transactions", "refresh", "syncFinish"].indexOf(event.detail.cmd) < 0) {
+            return;
+        }
+        this.documentDefinitions.clear();
+        this.definitionRefreshAfter = Date.now() + ACTIVE_REFRESH_DELAY;
+        if (this.enabled) {
+            this.markAllBlocksDirty();
+            // SQL indexing follows the editor transaction asynchronously.
+            this.scheduleRefresh(ACTIVE_REFRESH_DELAY);
+        }
     };
 
     private readonly handleBeforeEdit = (event: Event) => {
@@ -130,6 +166,16 @@ export default class FootnoteJumperPlugin extends Plugin {
             return;
         }
 
+        if (this.isTooltipTarget(event.target)) {
+            this.tooltipInteracting = true;
+            this.cancelTooltipHide();
+            return;
+        }
+
+        if (this.isReturnButtonTarget(event.target)) {
+            return;
+        }
+
         if (this.getReferenceElement(event.target)) {
             this.suppressSelectionSync = true;
             return;
@@ -147,7 +193,13 @@ export default class FootnoteJumperPlugin extends Plugin {
         }
     };
 
-    private readonly handlePointerUp = () => {
+    private readonly handlePointerUp = (event: PointerEvent) => {
+        if (this.tooltipInteracting) {
+            this.tooltipInteracting = false;
+            if (!this.isTooltipTarget(event.target) && !this.getReferenceElement(event.target)) {
+                this.scheduleTooltipHide();
+            }
+        }
         if (!this.suppressSelectionSync) {
             return;
         }
@@ -159,7 +211,8 @@ export default class FootnoteJumperPlugin extends Plugin {
     };
 
     private readonly handleSelectionChange = () => {
-        if (!this.enabled || this.isRendering || this.isComposing || this.suppressSelectionSync) {
+        if (!this.enabled || this.isRendering || this.isComposing || this.suppressSelectionSync
+            || this.tooltipInteracting) {
             return;
         }
 
@@ -171,17 +224,27 @@ export default class FootnoteJumperPlugin extends Plugin {
             return;
         }
 
+        if (this.isTooltipTarget(event.target)) {
+            this.cancelTooltipHide();
+            return;
+        }
+
         const refElement = this.getReferenceElement(event.target);
         if (!refElement) {
             return;
         }
 
+        this.cancelTooltipHide();
+        if (this.activeTooltipRef === refElement) {
+            return;
+        }
         this.activeTooltipRef = refElement;
         this.showTooltip(refElement);
     };
 
-    private readonly handlePointerMove = () => {
-        if (!this.enabled || !this.activeTooltipRef) {
+    private readonly handlePointerMove = (event: PointerEvent) => {
+        if (!this.enabled || !this.activeTooltipRef || this.tooltipInteracting
+            || this.isTooltipTarget(event.target)) {
             return;
         }
 
@@ -190,20 +253,27 @@ export default class FootnoteJumperPlugin extends Plugin {
 
     private readonly handlePointerOut = (event: PointerEvent) => {
         const refElement = this.getReferenceElement(event.target);
-        if (!refElement) {
+        const fromTooltip = this.isTooltipTarget(event.target);
+        if (!refElement && !fromTooltip) {
             return;
         }
 
         const nextTarget = event.relatedTarget as HTMLElement | null;
-        if (nextTarget && refElement.contains(nextTarget)) {
+        if (nextTarget && (refElement?.contains(nextTarget)
+            || this.activeTooltipRef?.contains(nextTarget) || this.isTooltipTarget(nextTarget))) {
+            this.cancelTooltipHide();
             return;
         }
 
-        this.hideTooltip();
+        this.scheduleTooltipHide();
     };
 
-    private readonly handleViewportChange = () => {
+    private readonly handleViewportChange = (event: Event) => {
         if (!this.enabled || !this.activeTooltipRef) {
+            return;
+        }
+
+        if (this.isTooltipTarget(event.target)) {
             return;
         }
 
@@ -234,9 +304,18 @@ export default class FootnoteJumperPlugin extends Plugin {
         });
         this.updateTopBarState();
 
+        for (const editor of getAllEditor()) {
+            this.registerEditor(editor?.protyle);
+        }
+        this.eventBus.on("loaded-protyle-static", this.handleProtyleLoaded);
+        this.eventBus.on("loaded-protyle-dynamic", this.handleProtyleLoaded);
+        this.eventBus.on("switch-protyle", this.handleProtyleLoaded);
+        this.eventBus.on("ws-main", this.handleKernelMessage);
+
         document.addEventListener("click", this.handleDocumentClick, true);
         document.addEventListener("pointerdown", this.handlePointerDown, true);
         document.addEventListener("pointerup", this.handlePointerUp, true);
+        document.addEventListener("pointercancel", this.handlePointerUp, true);
         document.addEventListener("pointerover", this.handlePointerOver, true);
         document.addEventListener("pointermove", this.handlePointerMove, true);
         document.addEventListener("pointerout", this.handlePointerOut, true);
@@ -259,6 +338,12 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     onunload() {
+        this.unloaded = true;
+        this.documentDefinitions.clear();
+        this.eventBus.off("loaded-protyle-static", this.handleProtyleLoaded);
+        this.eventBus.off("loaded-protyle-dynamic", this.handleProtyleLoaded);
+        this.eventBus.off("switch-protyle", this.handleProtyleLoaded);
+        this.eventBus.off("ws-main", this.handleKernelMessage);
         window.clearTimeout(this.refreshTimer);
         this.refreshTimer = 0;
         this.refreshTimerAt = 0;
@@ -266,6 +351,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         document.removeEventListener("click", this.handleDocumentClick, true);
         document.removeEventListener("pointerdown", this.handlePointerDown, true);
         document.removeEventListener("pointerup", this.handlePointerUp, true);
+        document.removeEventListener("pointercancel", this.handlePointerUp, true);
         document.removeEventListener("pointerover", this.handlePointerOver, true);
         document.removeEventListener("pointermove", this.handlePointerMove, true);
         document.removeEventListener("pointerout", this.handlePointerOut, true);
@@ -276,6 +362,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         document.removeEventListener("scroll", this.handleViewportChange, true);
         window.removeEventListener("resize", this.handleViewportChange);
         this.destroyTooltip();
+        this.clearReturnOrigin();
         this.cleanupEnhancements();
     }
 
@@ -351,6 +438,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         this.saveSettings();
 
         if (this.enabled) {
+            this.documentDefinitions.clear();
             this.startObserving();
             this.activeBlock = this.getSelectionBlock();
             this.activeBlockId = this.activeBlock?.dataset.nodeId;
@@ -367,6 +455,7 @@ export default class FootnoteJumperPlugin extends Plugin {
             this.activeBlock = undefined;
             this.activeBlockId = undefined;
             this.hideTooltip();
+            this.clearReturnOrigin();
             this.cleanupEnhancements();
             showMessage("脚注跳转已关闭");
         }
@@ -393,7 +482,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         }
     }
 
-    private confirmAddNativeBlockRefs() {
+    private async confirmAddNativeBlockRefs() {
         const editor = getActiveEditor();
         const wysiwyg = editor?.protyle?.wysiwyg?.element;
         const rootId = editor?.protyle?.block?.rootID;
@@ -402,6 +491,11 @@ export default class FootnoteJumperPlugin extends Plugin {
             return;
         }
 
+        this.registerEditor(editor.protyle);
+        await this.ensureDocumentDefinitions(rootId);
+        if (this.unloaded || getActiveEditor()?.protyle?.block?.rootID !== rootId) {
+            return;
+        }
         const updates = this.prepareNativeBlockRefUpdates(wysiwyg);
         const referenceCount = updates.reduce((count, update) => count + update.referenceCount, 0);
         if (referenceCount === 0) {
@@ -489,7 +583,7 @@ export default class FootnoteJumperPlugin extends Plugin {
 
         for (const reference of enhancedRefs) {
             const id = reference.dataset.footnoteId;
-            const definitionBlockId = id ? definitions.get(id)?.element.dataset.nodeId : undefined;
+            const definitionBlockId = id ? definitions.get(id)?.blockId : undefined;
             if (!id || !definitionBlockId) {
                 continue;
             }
@@ -529,7 +623,7 @@ export default class FootnoteJumperPlugin extends Plugin {
             const fragment = document.createDocumentFragment();
 
             while ((match = regex.exec(text)) !== null) {
-                const definitionBlockId = definitions.get(match[1])?.element.dataset.nodeId;
+                const definitionBlockId = definitions.get(match[1])?.blockId;
                 if (!definitionBlockId) {
                     continue;
                 }
@@ -872,6 +966,10 @@ export default class FootnoteJumperPlugin extends Plugin {
             return;
         }
 
+        if (this.activeTooltipRef && !this.activeTooltipRef.isConnected) {
+            this.hideTooltip();
+        }
+
         if (this.activeBlock && !this.activeBlock.isConnected) {
             const selectionBlock = this.getSelectionBlock();
             const replacement = selectionBlock && this.isActiveBlock(selectionBlock)
@@ -895,17 +993,20 @@ export default class FootnoteJumperPlugin extends Plugin {
 
         const editors = Array.from(document.querySelectorAll<HTMLElement>(".protyle-wysiwyg"));
         const definitionsByEditor = new Map<HTMLElement, Map<string, FootnoteDefinition>>();
-        this.definitions.clear();
+        for (const editor of getAllEditor()) {
+            this.registerEditor(editor?.protyle);
+        }
 
         for (const editor of editors) {
+            const rootId = this.editorProtyles.get(editor)?.block?.rootID;
+            if (rootId) {
+                void this.ensureDocumentDefinitions(rootId);
+            }
             const definitions = this.collectDefinitions(editor);
             definitionsByEditor.set(editor, definitions);
-            for (const [id, definition] of definitions) {
-                this.definitions.set(id, definition);
-            }
 
             const signature = Array.from(definitions.values())
-                .map((definition) => `${definition.id}\u0000${definition.content}`)
+                .map((definition) => `${definition.id}\u0000${definition.blockId}\u0000${definition.content}`)
                 .join("\u0001");
             const definitionChanged = this.definitionSignatures.get(editor) !== signature;
             if (definitionChanged) {
@@ -939,6 +1040,10 @@ export default class FootnoteJumperPlugin extends Plugin {
                 }
 
                 const bookmark = this.isActiveBlock(block) ? this.captureSelection(block) : undefined;
+                const tooltipId = this.activeTooltipRef && block.contains(this.activeTooltipRef)
+                    ? this.activeTooltipRef.dataset.footnoteId : undefined;
+                const tooltipIndex = tooltipId ? Array.from(block.querySelectorAll<HTMLElement>(`.${REF_CLASS}`))
+                    .filter((ref) => ref.dataset.footnoteId === tooltipId).indexOf(this.activeTooltipRef) : -1;
                 this.cleanupBlock(block);
 
                 if (definitions) {
@@ -948,6 +1053,20 @@ export default class FootnoteJumperPlugin extends Plugin {
                         block.dataset.footnoteId = definition.id;
                     }
                     this.wrapReferences(block, definitions);
+                }
+
+                if (tooltipId) {
+                    // Rendering replaces marker nodes. Keep the current preview
+                    // and scroll position attached to the replacement marker.
+                    const replacement = Array.from(block.querySelectorAll<HTMLElement>(`.${REF_CLASS}`))
+                        .filter((ref) => ref.dataset.footnoteId === tooltipId)[tooltipIndex];
+                    if (replacement) {
+                        this.activeTooltipRef = replacement;
+                        this.updateTooltipContent(replacement.dataset.preview || "未找到对应脚注定义");
+                        this.positionTooltip(replacement);
+                    } else {
+                        this.hideTooltip();
+                    }
                 }
 
                 if (bookmark) {
@@ -973,19 +1092,26 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     private collectDefinitions(root: HTMLElement) {
-        const definitions = new Map<string, FootnoteDefinition>();
+        const rootId = this.editorProtyles.get(root)?.block?.rootID;
+        const definitions = new Map<string, FootnoteDefinition>(this.documentDefinitions.get(rootId)?.definitions);
         const blocks = Array.from(root.querySelectorAll<HTMLElement>("[data-node-id]"));
+        const loadedIds = new Set(blocks.map((block) => block.dataset.nodeId));
+        // Visible content is newer than the SQL index, including deleted/renamed definitions.
+        for (const [id, definition] of definitions) {
+            if (loadedIds.has(definition.blockId)) {
+                definitions.delete(id);
+            }
+        }
 
         for (const block of blocks) {
-            const text = this.getVisibleText(block).trim();
-            const match = text.match(/^\[\^([^\]\s:]+)\]:\s*([\s\S]*)$/);
-            if (!match) {
+            const parsed = parseDefinition(this.getVisibleText(block));
+            if (!parsed) {
                 continue;
             }
 
             const definition: FootnoteDefinition = {
-                id: match[1],
-                content: match[2].trim() || "空脚注",
+                ...parsed,
+                blockId: block.dataset.nodeId,
                 element: block,
             };
             definitions.set(definition.id, definition);
@@ -1099,7 +1225,6 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     private cleanupBlock(block: HTMLElement) {
-        this.hideTooltip();
         const refs = Array.from(block.querySelectorAll<HTMLElement>(`.${REF_CLASS}[${ENHANCED_ATTR}]`))
             .filter((ref) => ref.closest("[data-node-id]") === block);
 
@@ -1117,20 +1242,182 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     private findDefinition(id: string, refElement: HTMLElement) {
-        const editor = refElement.closest(".protyle-wysiwyg");
-        const localDefinition = editor
-            ? Array.from(editor.querySelectorAll<HTMLElement>(`.${DEF_CLASS}`)).find((item) => item.dataset.footnoteId === id)
-            : undefined;
+        const editor = refElement.closest<HTMLElement>(".protyle-wysiwyg");
+        return editor ? this.collectDefinitions(editor).get(id) : undefined;
+    }
 
-        if (localDefinition) {
-            return {
-                id,
-                content: this.getVisibleText(localDefinition).trim(),
-                element: localDefinition,
-            };
+    private registerEditor(protyle: IProtyle) {
+        if (protyle?.wysiwyg?.element) {
+            this.editorProtyles.set(protyle.wysiwyg.element, protyle);
         }
+    }
 
-        return this.definitions.get(id);
+    private ensureDocumentDefinitions(rootId: string) {
+        let state = this.documentDefinitions.get(rootId);
+        if (state?.loading) {
+            return state.loading;
+        }
+        if (state && Date.now() < state.expiresAt) {
+            return Promise.resolve();
+        }
+        state = {definitions: state?.definitions || new Map(), expiresAt: 0};
+        this.documentDefinitions.set(rootId, state);
+        const current = state;
+        current.loading = readDocumentDefinitions(rootId, async (stmt) => {
+            const response = await fetchSyncPost("/api/query/sql", {stmt});
+            if (response.code !== 0 || !Array.isArray(response.data)) {
+                throw new Error(response.msg || "Unable to read footnote definitions");
+            }
+            return response.data;
+        }).then((definitions) => {
+            if (this.unloaded || this.documentDefinitions.get(rootId) !== current) {
+                return;
+            }
+            current.definitions = definitions;
+            // An interaction may query before the asynchronous SQL index catches
+            // up. Let the scheduled post-edit refresh replace that early result.
+            const now = Date.now();
+            current.expiresAt = now < this.definitionRefreshAfter
+                ? this.definitionRefreshAfter
+                : now + 30000;
+            if (this.enabled) {
+                this.markAllBlocksDirty();
+                this.scheduleRefresh(0);
+            }
+        }).catch((error) => {
+            current.expiresAt = Date.now() + 5000;
+            console.warn(`[${this.name}] read footnote definitions failed`, error);
+        }).then(() => {
+            current.loading = undefined;
+        });
+        return current.loading;
+    }
+
+    private async resolveDefinition(id: string, refElement: HTMLElement) {
+        const editor = refElement.closest<HTMLElement>(".protyle-wysiwyg");
+        const rootId = editor && this.editorProtyles.get(editor)?.block?.rootID;
+        if (rootId) {
+            await this.ensureDocumentDefinitions(rootId);
+        }
+        if (this.unloaded || !this.enabled || !refElement.isConnected
+            || (rootId && this.editorProtyles.get(editor)?.block?.rootID !== rootId)) {
+            return undefined;
+        }
+        return this.findDefinition(id, refElement);
+    }
+
+    private async jumpToDefinition(id: string, refElement: HTMLElement) {
+        const editor = refElement.closest<HTMLElement>(".protyle-wysiwyg");
+        const rootId = editor && this.editorProtyles.get(editor)?.block?.rootID;
+        const block = refElement.closest<HTMLElement>("[data-node-id]");
+        const origin: FootnoteOrigin | undefined = rootId && block?.dataset.nodeId ? {
+            rootId,
+            blockId: block.dataset.nodeId,
+            footnoteId: id,
+            referenceIndex: this.getBlockReferences(block, id).indexOf(refElement),
+        } : undefined;
+        const definition = await this.resolveDefinition(id, refElement);
+        if (rootId && this.editorProtyles.get(editor)?.block?.rootID !== rootId) {
+            return;
+        }
+        if (!definition) {
+            if (!this.unloaded && this.enabled && refElement.isConnected) {
+                showMessage(`未找到脚注 [^${id}] 的定义`);
+            }
+            return;
+        }
+        this.hideTooltip();
+        if (definition.element?.isConnected) {
+            this.scrollToElement(definition.element);
+            this.rememberReturnOrigin(origin);
+            return;
+        }
+        try {
+            await this.openBlock(definition.blockId);
+            this.rememberReturnOrigin(origin);
+        } catch (error) {
+            console.warn(`[${this.name}] jump to footnote failed`, error);
+            showMessage("脚注跳转失败，请重试", 3000, "error");
+        }
+    }
+
+    private getBlockReferences(block: HTMLElement, id: string) {
+        return Array.from(block.querySelectorAll<HTMLElement>(`.${REF_CLASS}`))
+            .filter((ref) => ref.dataset.footnoteId === id && ref.closest("[data-node-id]") === block);
+    }
+
+    private scrollToElement(element: HTMLElement) {
+        element.scrollIntoView({behavior: "smooth", block: "center"});
+        element.classList.remove(HIGHLIGHT_CLASS);
+        window.setTimeout(() => element.classList.add(HIGHLIGHT_CLASS), 30);
+        window.setTimeout(() => element.classList.remove(HIGHLIGHT_CLASS), 1800);
+    }
+
+    private async openBlock(blockId: string) {
+        const frontend = getFrontend();
+        if (frontend === "mobile" || frontend === "browser-mobile") {
+            openMobileFileById(this.app, blockId, ["cb-get-hl", "cb-get-context"]);
+        } else {
+            await openTab({app: this.app, doc: {id: blockId, action: ["cb-get-hl", "cb-get-context"]}});
+        }
+    }
+
+    private rememberReturnOrigin(origin?: FootnoteOrigin) {
+        if (!origin || !this.enabled || this.unloaded) {
+            return;
+        }
+        this.returnOrigin = origin;
+        if (!this.returnButton) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = RETURN_BUTTON_CLASS;
+            document.body.append(button);
+            this.returnButton = button;
+        }
+        this.returnButton.textContent = `↩ 返回正文 [^${origin.footnoteId}]`;
+    }
+
+    private isReturnButtonTarget(target: EventTarget | null) {
+        return target instanceof Node && Boolean(this.returnButton?.contains(target));
+    }
+
+    private async returnToReference() {
+        const origin = this.returnOrigin;
+        if (!origin || !this.enabled || this.unloaded || this.returnButton?.disabled) {
+            return;
+        }
+        if (this.returnButton) {
+            this.returnButton.disabled = true;
+        }
+        this.hideTooltip();
+        try {
+            const protyle = getActiveEditor()?.protyle;
+            const editor = protyle?.block?.rootID === origin.rootId ? protyle.wysiwyg?.element : undefined;
+            const block = editor && Array.from(editor.querySelectorAll<HTMLElement>("[data-node-id]"))
+                .find((item) => item.dataset.nodeId === origin.blockId);
+            if (block?.isConnected) {
+                const ref = this.getBlockReferences(block, origin.footnoteId)[origin.referenceIndex];
+                this.scrollToElement(ref || block);
+            } else {
+                await this.openBlock(origin.blockId);
+            }
+            if (this.returnOrigin === origin) {
+                this.clearReturnOrigin();
+            }
+        } catch (error) {
+            console.warn(`[${this.name}] return to footnote reference failed`, error);
+            showMessage("返回正文失败，请重试", 3000, "error");
+        } finally {
+            if (this.returnButton) {
+                this.returnButton.disabled = false;
+            }
+        }
+    }
+
+    private clearReturnOrigin() {
+        this.returnOrigin = undefined;
+        this.returnButton?.remove();
+        this.returnButton = undefined;
     }
 
     private getVisibleText(element: HTMLElement) {
@@ -1145,6 +1432,10 @@ export default class FootnoteJumperPlugin extends Plugin {
         return target.closest(`.${REF_CLASS}`) as HTMLElement | null || undefined;
     }
 
+    private isTooltipTarget(target: EventTarget | null) {
+        return target instanceof Node && Boolean(this.tooltipElement?.contains(target));
+    }
+
     private showTooltip(refElement: HTMLElement) {
         const text = refElement.dataset.preview;
         if (!text) {
@@ -1155,9 +1446,23 @@ export default class FootnoteJumperPlugin extends Plugin {
         refElement.removeAttribute("title");
         refElement.removeAttribute("aria-label");
         const tooltip = this.ensureTooltip();
-        tooltip.textContent = text;
+        this.updateTooltipContent(text);
+        tooltip.scrollTop = 0;
+        tooltip.scrollLeft = 0;
         tooltip.classList.add(TOOLTIP_VISIBLE_CLASS);
         this.positionTooltip(refElement);
+        const id = refElement.dataset.footnoteId;
+        if (id) {
+            void this.resolveDefinition(id, refElement).then((definition) => {
+                if (this.activeTooltipRef !== refElement || !definition) {
+                    return;
+                }
+                refElement.dataset.preview = definition.content;
+                refElement.classList.remove(MISSING_CLASS);
+                this.updateTooltipContent(definition.content);
+                this.positionTooltip(refElement);
+            });
+        }
     }
 
     private ensureTooltip() {
@@ -1171,6 +1476,13 @@ export default class FootnoteJumperPlugin extends Plugin {
         document.body.append(tooltip);
         this.tooltipElement = tooltip;
         return tooltip;
+    }
+
+    private updateTooltipContent(text: string) {
+        // Do not rebuild unchanged text while a user scrolls or selects it.
+        if (this.tooltipElement && this.tooltipElement.textContent !== text) {
+            this.tooltipElement.textContent = text;
+        }
     }
 
     private positionTooltip(refElement: HTMLElement) {
@@ -1199,12 +1511,28 @@ export default class FootnoteJumperPlugin extends Plugin {
         tooltip.style.top = `${Math.round(top)}px`;
     }
 
+    private cancelTooltipHide() {
+        window.clearTimeout(this.tooltipHideTimer);
+        this.tooltipHideTimer = 0;
+    }
+
+    private scheduleTooltipHide() {
+        if (!this.activeTooltipRef || this.tooltipInteracting) {
+            return;
+        }
+        this.cancelTooltipHide();
+        this.tooltipHideTimer = window.setTimeout(() => this.hideTooltip(), TOOLTIP_HIDE_DELAY);
+    }
+
     private hideTooltip() {
+        this.cancelTooltipHide();
+        this.tooltipInteracting = false;
         this.activeTooltipRef = undefined;
         this.tooltipElement?.classList.remove(TOOLTIP_VISIBLE_CLASS);
     }
 
     private destroyTooltip() {
+        this.hideTooltip();
         this.tooltipElement?.remove();
         this.tooltipElement = undefined;
         this.activeTooltipRef = undefined;

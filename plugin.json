@@ -2,7 +2,7 @@
   "name": "siyuan-footnote-jumper",
   "author": "lisontowind",
   "url": "https://github.com/lisontowind/siyuan-footnote-jumper",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "minAppVersion": "3.7.0",
   "kernels": [
     "all"

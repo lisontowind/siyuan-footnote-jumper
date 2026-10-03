@@ -34,6 +34,9 @@
     max-width: min(420px, calc(100vw - 24px));
     max-height: min(260px, calc(100vh - 24px));
     overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: auto;
+    user-select: text;
     padding: 8px 10px;
     color: var(--b3-theme-on-background);
     background: var(--b3-theme-surface);
@@ -52,7 +55,33 @@
 
 .siyuan-footnote-tooltip--visible {
     opacity: 1;
+    pointer-events: auto;
     transform: translateY(0);
+}
+
+.siyuan-footnote-return {
+    position: fixed;
+    right: 24px;
+    bottom: 24px;
+    z-index: 2147483646;
+    max-width: calc(100vw - 48px);
+    padding: 8px 14px;
+    color: var(--b3-theme-on-background);
+    background: var(--b3-theme-surface);
+    border: 1px solid var(--b3-theme-surface-lighter);
+    border-radius: 6px;
+    box-shadow: var(--b3-dialog-shadow);
+    font-size: 13px;
+    cursor: pointer;
+
+    &:hover {
+        color: var(--b3-theme-primary);
+    }
+
+    &:disabled {
+        opacity: 0.6;
+        cursor: wait;
+    }
 }
 
 .siyuan-footnote-definition {
