@@ -1,5 +1,7 @@
 import {confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Menu, openMobileFileById, openTab, Plugin, showMessage} from "siyuan";
-import {parseDefinition, readDocumentDefinitions, StoredDefinition} from "./definitions";
+import {DefinitionCandidate, indexDefinitions, parseDefinition, readDocumentDefinitions, readOrderedDefinitions, StoredDefinition} from "./definitions";
+import {FootnoteManager} from "./manager";
+import {readMarkers, replaceTextRun, visitInline, wrapTextRun} from "./inline";
 import "./index.scss";
 
 const STORAGE_NAME = "footnote-jumper-settings";
@@ -8,13 +10,16 @@ const REF_CLASS = "siyuan-footnote-ref";
 const DEF_CLASS = "siyuan-footnote-definition";
 const HIGHLIGHT_CLASS = "siyuan-footnote-definition--highlight";
 const MISSING_CLASS = "siyuan-footnote-ref--missing";
+const CONFLICT_CLASS = "siyuan-footnote-ref--conflict";
 const TOOLTIP_CLASS = "siyuan-footnote-tooltip";
 const TOOLTIP_VISIBLE_CLASS = "siyuan-footnote-tooltip--visible";
 const RETURN_BUTTON_CLASS = "siyuan-footnote-return";
 const NATIVE_BLOCK_REF_TYPE = "block-ref";
+const NATIVE_REF_CLASS = "siyuan-footnote-native-ref";
 const ACTIVE_REFRESH_DELAY = 1000;
 const INACTIVE_REFRESH_DELAY = 200;
 const TOOLTIP_HIDE_DELAY = 300;
+const TABLE_EDIT_MESSAGE = "请先结束表格编辑并等待保存，再执行全文操作";
 
 interface FootnoteSettings {
     enabled: boolean;
@@ -38,7 +43,17 @@ interface SelectionBookmark {
 
 interface NativeBlockRefUpdate {
     operation: IOperation;
+    undoOperation: IOperation;
     referenceCount: number;
+}
+
+interface KernelOperation extends IOperation {
+    rootID?: string;
+}
+
+interface KernelTransaction {
+    rootID?: string;
+    doOperations?: KernelOperation[];
 }
 
 interface FootnoteOrigin {
@@ -61,9 +76,12 @@ export default class FootnoteJumperPlugin extends Plugin {
     private suppressSelectionSync = false;
     private editorProtyles = new WeakMap<HTMLElement, IProtyle>();
     private documentDefinitions = new Map<string, DocumentDefinitions>();
-    private definitionRefreshAfter = 0;
+    private definitionRefreshAfter = new Map<string, number>();
+    private blockRootIds = new Map<string, string>();
+    private definitionDirtyRoots = new Set<string>();
     private unloaded = false;
     private definitionSignatures = new WeakMap<HTMLElement, string>();
+    private orderedDefinitionBlocks = new WeakMap<HTMLElement, DefinitionCandidate>();
     private dirtyBlocks = new Set<HTMLElement>();
     private activeBlock?: HTMLElement;
     private activeBlockId?: string;
@@ -74,6 +92,7 @@ export default class FootnoteJumperPlugin extends Plugin {
     private returnOrigin?: FootnoteOrigin;
     private returnButton?: HTMLButtonElement;
     private isAddingNativeBlockRefs = false;
+    private footnoteManager?: FootnoteManager;
 
     private readonly handleDocumentClick = (event: MouseEvent) => {
         if (!this.enabled) {
@@ -104,6 +123,7 @@ export default class FootnoteJumperPlugin extends Plugin {
 
     private readonly handleProtyleLoaded = (event: CustomEvent<{protyle: IProtyle}>) => {
         const protyle = event.detail.protyle;
+        if (protyle?.wysiwyg?.element?.closest("[data-footnote-sidebar]")) return;
         this.registerEditor(protyle);
         if (this.enabled && protyle.wysiwyg?.element) {
             this.markEditorDirty(protyle.wysiwyg.element);
@@ -111,18 +131,75 @@ export default class FootnoteJumperPlugin extends Plugin {
         }
     };
 
-    private readonly handleKernelMessage = (event: CustomEvent<{cmd: string}>) => {
+    private readonly handleKernelMessage = (event: CustomEvent<{cmd: string; data?: KernelTransaction | KernelTransaction[]}>) => {
         if (["transactions", "refresh", "syncFinish"].indexOf(event.detail.cmd) < 0) {
             return;
         }
-        this.documentDefinitions.clear();
-        this.definitionRefreshAfter = Date.now() + ACTIVE_REFRESH_DELAY;
-        if (this.enabled) {
-            this.markAllBlocksDirty();
-            // SQL indexing follows the editor transaction asynchronously.
+        const data = event.detail.data;
+        const transactions = Array.isArray(data) ? data : data ? [data] : [];
+        const operations = transactions.reduce<KernelOperation[]>((all, transaction) =>
+            all.concat(transaction.doOperations || []), []);
+        const roots = new Set<string>();
+        let unknown = !transactions.length;
+        for (const transaction of transactions) {
+            if (transaction.rootID && !transaction.doOperations?.length) {
+                roots.add(transaction.rootID);
+            }
+            if (!transaction.rootID && !transaction.doOperations?.length) unknown = true;
+            for (const operation of transaction.doOperations || []) {
+                const rootId = operation.rootID || transaction.rootID
+                    || this.blockRootIds.get(operation.id)
+                    || this.blockRootIds.get(operation.parentID)
+                    || this.blockRootIds.get(operation.previousID);
+                if (!rootId) {
+                    unknown = true;
+                    continue;
+                }
+                // Ordinary text updates need no new SQL definition index.
+                const state = this.documentDefinitions.get(rootId);
+                const wasDefinition = Array.from(state?.definitions.values() || []).some((definition) =>
+                    (definition.candidates || [definition]).some((candidate) => candidate.blockId === operation.id));
+                if (operation.action !== "update" || wasDefinition || state?.loading
+                    || (typeof operation.data === "string" && /\[\^[^\]\s:]+\]:|NodeList|custom-footnote-label/.test(operation.data))) {
+                    roots.add(rootId);
+                }
+                this.markOperationDirty(rootId, operation.id);
+            }
+        }
+        // Synchronization and unrecognized payloads retain the conservative fallback.
+        if (event.detail.cmd !== "transactions" || unknown) {
+            for (const rootId of this.documentDefinitions.keys()) {
+                roots.add(rootId);
+            }
+            for (const editor of getAllEditor()) {
+                const rootId = editor?.protyle?.block?.rootID;
+                if (rootId) roots.add(rootId);
+            }
+        }
+        for (const rootId of roots) {
+            this.invalidateDocumentDefinitions(rootId);
+        }
+        if (this.enabled && (roots.size || operations.length)) {
             this.scheduleRefresh(ACTIVE_REFRESH_DELAY);
         }
     };
+
+    private invalidateDocumentDefinitions(rootId: string) {
+        this.documentDefinitions.delete(rootId);
+        this.definitionRefreshAfter.set(rootId, Date.now() + ACTIVE_REFRESH_DELAY);
+        this.definitionDirtyRoots.add(rootId);
+    }
+
+    private markOperationDirty(rootId: string, blockId?: string) {
+        if (!this.enabled) return;
+        for (const editor of getAllEditor()) {
+            const protyle = editor?.protyle;
+            if (protyle?.block?.rootID !== rootId || !protyle.wysiwyg?.element) continue;
+            const block = Array.from(protyle.wysiwyg.element.querySelectorAll<HTMLElement>("[data-node-id]"))
+                .find((item) => item.dataset.nodeId === blockId);
+            if (block) this.markBlockDirty(block);
+        }
+    }
 
     private readonly handleBeforeEdit = (event: Event) => {
         if (!this.enabled || this.isRendering) {
@@ -292,6 +369,31 @@ export default class FootnoteJumperPlugin extends Plugin {
                 <path d="M22 18h3v3h3v3h-3v3h-3v-3h-3v-3h3v-3z"></path>
             </symbol>
         `);
+        this.footnoteManager = new FootnoteManager(this, {
+            navigate: async (blockId) => {
+                for (const editor of getAllEditor()) {
+                    const element = editor?.protyle?.wysiwyg?.element;
+                    if (!element || element.closest("[data-footnote-sidebar]")) continue;
+                    const block = Array.from(element.querySelectorAll<HTMLElement>("[data-node-id]"))
+                        .find((item) => item.dataset.nodeId === blockId && !item.closest('[data-type="NodeBlockQueryEmbed"]'));
+                    if (block?.isConnected && element.getClientRects().length) {
+                        this.scrollToElement(block);
+                        return;
+                    }
+                }
+                await this.openBlock(blockId);
+            },
+            tablePending: (block) => this.isActiveBlock(block) || this.dirtyBlocks.has(block)
+                || Boolean(window.getSelection()?.anchorNode && block.contains(window.getSelection().anchorNode)),
+            changed: (rootId) => {
+                this.invalidateDocumentDefinitions(rootId);
+                for (const editor of getAllEditor()) {
+                    if (editor?.protyle?.block?.rootID === rootId) this.markEditorDirty(editor.protyle.wysiwyg.element);
+                }
+                this.scheduleRefresh(ACTIVE_REFRESH_DELAY);
+            },
+        });
+        this.footnoteManager.register();
     }
 
     async onLayoutReady() {
@@ -339,7 +441,12 @@ export default class FootnoteJumperPlugin extends Plugin {
 
     onunload() {
         this.unloaded = true;
+        this.footnoteManager?.destroy();
+        this.footnoteManager = undefined;
         this.documentDefinitions.clear();
+        this.blockRootIds.clear();
+        this.definitionRefreshAfter.clear();
+        this.definitionDirtyRoots.clear();
         this.eventBus.off("loaded-protyle-static", this.handleProtyleLoaded);
         this.eventBus.off("loaded-protyle-dynamic", this.handleProtyleLoaded);
         this.eventBus.off("switch-protyle", this.handleProtyleLoaded);
@@ -396,6 +503,12 @@ export default class FootnoteJumperPlugin extends Plugin {
 
         const menu = new Menu("siyuan-footnote-jumper-menu");
         menu.addItem({
+            label: "打开脚注侧栏",
+            icon: "iconFootnoteJumper",
+            click: () => this.footnoteManager?.open(),
+        });
+        menu.addSeparator();
+        menu.addItem({
             label: "脚注跳转",
             icon: "iconFootnoteJumper",
             checked: this.enabled,
@@ -413,12 +526,22 @@ export default class FootnoteJumperPlugin extends Plugin {
         });
         menu.addSeparator();
         menu.addItem({
+            label: "检查重复脚注编号",
+            icon: "iconSearch",
+            click: () => { void this.checkDuplicateDefinitions(); },
+        });
+        menu.addItem({
             label: "为脚注标记添加块引",
             icon: "iconLink",
             disabled: this.isAddingNativeBlockRefs,
             click: () => {
                 this.confirmAddNativeBlockRefs();
             },
+        });
+        menu.addItem({
+            label: "转换脚注定义格式",
+            icon: "iconFootnoteJumper",
+            click: () => this.footnoteManager?.open(),
         });
 
         const rect = this.topBarElement?.getBoundingClientRect();
@@ -483,6 +606,7 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     private async confirmAddNativeBlockRefs() {
+        if (this.isAddingNativeBlockRefs || this.unloaded) return;
         const editor = getActiveEditor();
         const wysiwyg = editor?.protyle?.wysiwyg?.element;
         const rootId = editor?.protyle?.block?.rootID;
@@ -492,29 +616,38 @@ export default class FootnoteJumperPlugin extends Plugin {
         }
 
         this.registerEditor(editor.protyle);
-        await this.ensureDocumentDefinitions(rootId);
-        if (this.unloaded || getActiveEditor()?.protyle?.block?.rootID !== rootId) {
+        this.isAddingNativeBlockRefs = true;
+        let updates: NativeBlockRefUpdate[];
+        try {
+            const blocks = await this.readDocumentBlocks(rootId, wysiwyg);
+            if (this.unloaded || getActiveEditor()?.protyle !== editor.protyle || this.isComposing) return;
+            updates = this.prepareNativeBlockRefUpdates(wysiwyg, blocks);
+        } catch (error) {
+            console.warn(`[${this.name}] prepare native block refs failed`, error);
+            showMessage(error instanceof Error && error.message === TABLE_EDIT_MESSAGE
+                ? TABLE_EDIT_MESSAGE : "读取全文失败，请重试", 4000, "error");
             return;
+        } finally {
+            this.isAddingNativeBlockRefs = false;
         }
-        const updates = this.prepareNativeBlockRefUpdates(wysiwyg);
         const referenceCount = updates.reduce((count, update) => count + update.referenceCount, 0);
         if (referenceCount === 0) {
-            showMessage("当前文档中没有可添加块引的脚注标记");
+            showMessage("全文没有可转换的脚注标记；缺失定义或重复编号的标记会跳过");
             return;
         }
 
         confirm(
             "为脚注标记添加块引",
-            `将在当前文档中把 ${referenceCount} 个脚注标记替换为指向脚注定义块的静态块引用，`
-                + "从而启用思源原生的悬浮预览。<br><br>此操作会修改笔记内容，但可以使用撤销恢复。是否继续？",
+            `将在全文（包括尚未加载的正文）中把 ${referenceCount} 个脚注标记替换为静态块引用。`
+                + "缺失定义或重复编号的标记会跳过。<br><br>此操作会修改笔记内容，但可以使用撤销恢复。是否继续？",
             () => {
-                this.addNativeBlockRefs(rootId);
+                void this.addNativeBlockRefs(rootId, updates);
             },
         );
     }
 
-    private addNativeBlockRefs(expectedRootId: string) {
-        if (this.isAddingNativeBlockRefs) {
+    private async addNativeBlockRefs(expectedRootId: string, reviewedUpdates: NativeBlockRefUpdate[]) {
+        if (this.isAddingNativeBlockRefs || this.unloaded) {
             return;
         }
 
@@ -525,36 +658,80 @@ export default class FootnoteJumperPlugin extends Plugin {
             return;
         }
 
-        const updates = this.prepareNativeBlockRefUpdates(wysiwyg);
-        const referenceCount = updates.reduce((count, update) => count + update.referenceCount, 0);
-        if (updates.length === 0 || referenceCount === 0) {
-            showMessage("没有找到仍需添加块引的脚注标记");
-            return;
-        }
-
         this.isAddingNativeBlockRefs = true;
         try {
-            editor.transaction(updates.map((update) => update.operation));
-            showMessage(`已为 ${referenceCount} 个脚注标记添加块引`);
+            const blocks = await this.readDocumentBlocks(expectedRootId, wysiwyg);
+            if (this.unloaded || this.isComposing || getActiveEditor()?.protyle !== editor.protyle) {
+                showMessage("编辑状态已改变，请重新执行该操作", 4000, "error");
+                return;
+            }
+            const updates = this.prepareNativeBlockRefUpdates(wysiwyg, blocks);
+            if (JSON.stringify(updates) !== JSON.stringify(reviewedUpdates)) {
+                showMessage("脚注或正文已改变，请重新执行并确认转换数量", 4000, "error");
+                return;
+            }
+            editor.transaction(updates.map((update) => update.operation),
+                updates.map((update) => update.undoOperation));
+            showMessage(`已提交 ${updates.reduce((count, update) => count + update.referenceCount, 0)} 个脚注标记的块引转换`);
         } catch (error) {
             console.error(`[${this.name}] add native block refs failed`, error);
-            showMessage("添加脚注块引失败，请查看日志", 5000, "error");
+            showMessage(error instanceof Error && error.message === TABLE_EDIT_MESSAGE
+                ? TABLE_EDIT_MESSAGE : "添加脚注块引失败，请查看日志", 5000, "error");
         } finally {
             this.isAddingNativeBlockRefs = false;
         }
     }
 
-    private prepareNativeBlockRefUpdates(wysiwyg: HTMLElement) {
-        const definitions = this.collectDefinitions(wysiwyg);
+    private async readDocumentBlocks(rootId: string, wysiwyg: HTMLElement) {
+        const response = await fetchSyncPost("/api/block/getBlockDOM", {id: rootId});
+        if (response.code !== 0 || typeof response.data?.dom !== "string" || !response.data.dom.trim()) {
+            throw new Error(response.msg || "Unable to read document DOM");
+        }
+        const template = document.createElement("template");
+        template.innerHTML = response.data.dom;
+        const blocks = new Map(Array.from(template.content.querySelectorAll<HTMLElement>("[data-node-id]"))
+            .filter((block) => this.isConvertibleBlock(block))
+            .map((block) => [block.dataset.nodeId, block] as const));
+        // Use the latest editor text, including edits not yet persisted. Tables
+        // use the complete kernel DOM because the editor may virtualize rows.
+        for (const block of Array.from(wysiwyg.querySelectorAll<HTMLElement>("[data-node-id]"))) {
+            if (!this.isConvertibleBlock(block)) continue;
+            if (block.dataset.type === "NodeTable") {
+                if (blocks.get(block.dataset.nodeId)?.textContent.includes("[^")
+                    && (this.isActiveBlock(block) || this.dirtyBlocks.has(block))) {
+                    throw new Error(TABLE_EDIT_MESSAGE);
+                }
+                continue;
+            }
+            const original = blocks.get(block.dataset.nodeId);
+            if (original) {
+                const clone = block.cloneNode(true) as HTMLElement;
+                original.replaceWith(clone);
+                blocks.set(block.dataset.nodeId, clone);
+            } else blocks.set(block.dataset.nodeId, block);
+        }
+        return Array.from(blocks.values()).sort((a, b) => a.dataset.nodeId.localeCompare(b.dataset.nodeId));
+    }
+
+    private isConvertibleBlock(block: HTMLElement) {
+        return !block.closest('[data-type="NodeBlockQueryEmbed"]')
+            && ["NodeParagraph", "NodeHeading", "NodeTable"].indexOf(block.dataset.type) >= 0;
+    }
+
+    private prepareNativeBlockRefUpdates(wysiwyg: HTMLElement, sourceBlocks?: HTMLElement[]) {
+        const blocks = sourceBlocks || Array.from(wysiwyg.querySelectorAll<HTMLElement>("[data-node-id]"));
+        const definitions = sourceBlocks ? this.indexBlockDefinitions(blocks) : this.collectDefinitions(wysiwyg);
         const updates: NativeBlockRefUpdate[] = [];
 
-        for (const block of Array.from(wysiwyg.querySelectorAll<HTMLElement>("[data-node-id]"))) {
+        for (const block of blocks) {
             const blockId = block.dataset.nodeId;
-            if (!blockId || Array.from(definitions.values()).some((definition) => definition.element === block)) {
+            if (!blockId || this.parseBlockDefinition(block)) {
                 continue;
             }
 
             const clone = block.cloneNode(true) as HTMLElement;
+            this.cleanupBlock(clone);
+            const oldHTML = clone.outerHTML;
             const referenceCount = this.convertFootnoteMarkersToNativeRefs(clone, definitions);
             if (referenceCount === 0) {
                 continue;
@@ -566,6 +743,7 @@ export default class FootnoteJumperPlugin extends Plugin {
                     id: blockId,
                     data: clone.outerHTML,
                 },
+                undoOperation: {action: "update", id: blockId, data: oldHTML},
                 referenceCount,
             });
         }
@@ -573,79 +751,20 @@ export default class FootnoteJumperPlugin extends Plugin {
         return updates;
     }
 
-    private convertFootnoteMarkersToNativeRefs(
-        block: HTMLElement,
-        definitions: Map<string, FootnoteDefinition>,
-    ) {
+    private convertFootnoteMarkersToNativeRefs(block: HTMLElement, definitions: Map<string, FootnoteDefinition>) {
+        // Undo the transient wrappers first; a split rich marker is still one ref.
+        this.cleanupBlock(block);
         let referenceCount = 0;
-        const enhancedRefs = Array.from(block.querySelectorAll<HTMLElement>(`.${REF_CLASS}[data-footnote-id]`))
-            .filter((reference) => reference.closest("[data-node-id]") === block);
-
-        for (const reference of enhancedRefs) {
-            const id = reference.dataset.footnoteId;
-            const definitionBlockId = id ? definitions.get(id)?.blockId : undefined;
-            if (!id || !definitionBlockId) {
-                continue;
+        visitInline(block, (nodes) => {
+            const matches = readMarkers(nodes);
+            for (const match of matches.reverse()) {
+                const definition = definitions.get(match[1]);
+                if (!definition?.blockId || definition.candidates) continue;
+                replaceTextRun(nodes, match.index, match.index + match[0].length,
+                    this.createNativeBlockRef(match[1], definition.blockId));
+                referenceCount++;
             }
-
-            reference.replaceWith(this.createNativeBlockRef(id, definitionBlockId));
-            referenceCount += 1;
-        }
-
-        const textNodes: Text[] = [];
-        const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
-            acceptNode: (node) => {
-                if (!(node.textContent || "").includes("[^")) {
-                    return NodeFilter.FILTER_REJECT;
-                }
-
-                const parent = node.parentElement;
-                if (!parent
-                    || parent.closest(`[data-type~="${NATIVE_BLOCK_REF_TYPE}"], [data-type~="code"], code, pre, style, script, textarea, input`)
-                    || parent.closest("[data-node-id]") !== block) {
-                    return NodeFilter.FILTER_REJECT;
-                }
-
-                return NodeFilter.FILTER_ACCEPT;
-            },
         });
-
-        while (walker.nextNode()) {
-            textNodes.push(walker.currentNode as Text);
-        }
-
-        for (const textNode of textNodes) {
-            const text = textNode.nodeValue || "";
-            const regex = /\[\^([^\]\s:]+)\]/g;
-            let match: RegExpExecArray | null;
-            let lastIndex = 0;
-            let changed = false;
-            const fragment = document.createDocumentFragment();
-
-            while ((match = regex.exec(text)) !== null) {
-                const definitionBlockId = definitions.get(match[1])?.blockId;
-                if (!definitionBlockId) {
-                    continue;
-                }
-
-                changed = true;
-                if (match.index > lastIndex) {
-                    fragment.append(document.createTextNode(text.slice(lastIndex, match.index)));
-                }
-                fragment.append(this.createNativeBlockRef(match[1], definitionBlockId));
-                lastIndex = match.index + match[0].length;
-                referenceCount += 1;
-            }
-
-            if (!changed) {
-                continue;
-            }
-            if (lastIndex < text.length) {
-                fragment.append(document.createTextNode(text.slice(lastIndex)));
-            }
-            textNode.replaceWith(fragment);
-        }
-
         return referenceCount;
     }
 
@@ -654,7 +773,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         reference.dataset.type = NATIVE_BLOCK_REF_TYPE;
         reference.dataset.subtype = "s";
         reference.dataset.id = definitionBlockId;
-        reference.textContent = `[^${id}]`;
+        reference.textContent = `[${id}]`;
         return reference;
     }
 
@@ -690,6 +809,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         let activeBlockChanged = false;
         let inactiveBlockChanged = false;
         const recordDirtyBlock = (block: HTMLElement) => {
+            if (block.closest("[data-footnote-sidebar]")) return;
             this.markBlockDirty(block);
             changed = true;
             if (this.isActiveBlock(block)) {
@@ -780,14 +900,18 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     private markBlockDirty(block: HTMLElement) {
-        if (block.closest(".protyle-wysiwyg")) {
+        if (block.closest('[data-type="NodeBlockQueryEmbed"], [data-footnote-sidebar]')) return;
+        const editor = block.closest<HTMLElement>(".protyle-wysiwyg");
+        if (editor) {
             this.dirtyBlocks.add(block);
+            const rootId = this.editorProtyles.get(editor)?.block?.rootID;
+            if (rootId && block.dataset.nodeId) this.blockRootIds.set(block.dataset.nodeId, rootId);
         }
     }
 
     private markEditorDirty(editor: HTMLElement) {
         for (const block of Array.from(editor.querySelectorAll<HTMLElement>("[data-node-id]"))) {
-            this.dirtyBlocks.add(block);
+            this.markBlockDirty(block);
         }
     }
 
@@ -803,6 +927,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         }
 
         const element = node instanceof HTMLElement ? node : node.parentElement;
+        if (element?.closest("[data-footnote-sidebar]")) return undefined;
         const block = element?.closest<HTMLElement>("[data-node-id]");
         return block?.closest(".protyle-wysiwyg") ? block : undefined;
     }
@@ -991,14 +1116,18 @@ export default class FootnoteJumperPlugin extends Plugin {
             }
         }
 
-        const editors = Array.from(document.querySelectorAll<HTMLElement>(".protyle-wysiwyg"));
+        const editors = Array.from(document.querySelectorAll<HTMLElement>(".protyle-wysiwyg"))
+            .filter((editor) => !editor.closest("[data-footnote-sidebar]"));
         const definitionsByEditor = new Map<HTMLElement, Map<string, FootnoteDefinition>>();
         for (const editor of getAllEditor()) {
             this.registerEditor(editor?.protyle);
         }
 
+        const dirtyEditors = new Set(Array.from(this.dirtyBlocks)
+            .map((block) => block.closest<HTMLElement>(".protyle-wysiwyg")));
         for (const editor of editors) {
             const rootId = this.editorProtyles.get(editor)?.block?.rootID;
+            if (!dirtyEditors.has(editor) && !this.definitionDirtyRoots.has(rootId)) continue;
             if (rootId) {
                 void this.ensureDocumentDefinitions(rootId);
             }
@@ -1006,12 +1135,22 @@ export default class FootnoteJumperPlugin extends Plugin {
             definitionsByEditor.set(editor, definitions);
 
             const signature = Array.from(definitions.values())
-                .map((definition) => `${definition.id}\u0000${definition.blockId}\u0000${definition.content}`)
+                .map((definition) => JSON.stringify(definition.candidates || [
+                    {id: definition.id, blockId: definition.blockId, content: definition.content}]))
+                .sort()
                 .join("\u0001");
             const definitionChanged = this.definitionSignatures.get(editor) !== signature;
             if (definitionChanged) {
                 this.markEditorDirty(editor);
                 this.definitionSignatures.set(editor, signature);
+            }
+        }
+        for (const rootId of this.definitionDirtyRoots) {
+            const remaining = (this.definitionRefreshAfter.get(rootId) || 0) - Date.now();
+            if (remaining > 0) {
+                this.scheduleRefresh(remaining);
+            } else {
+                this.definitionDirtyRoots.delete(rootId);
             }
         }
 
@@ -1032,6 +1171,7 @@ export default class FootnoteJumperPlugin extends Plugin {
                 const definitions = editor ? definitionsByEditor.get(editor) : undefined;
                 const needsEnhancement = block.classList.contains(DEF_CLASS)
                     || Boolean(block.querySelector(`.${REF_CLASS}[${ENHANCED_ATTR}]`))
+                    || Boolean(block.querySelector('[data-type~="block-ref"]'))
                     || this.getVisibleText(block).includes("[^");
 
                 if (!needsEnhancement) {
@@ -1047,12 +1187,13 @@ export default class FootnoteJumperPlugin extends Plugin {
                 this.cleanupBlock(block);
 
                 if (definitions) {
-                    const definition = Array.from(definitions.values()).find((item) => item.element === block);
-                    if (definition) {
+                    const parsed = this.parseBlockDefinition(block);
+                    if (parsed) {
                         block.classList.add(DEF_CLASS);
-                        block.dataset.footnoteId = definition.id;
+                        block.dataset.footnoteId = parsed.id;
                     }
                     this.wrapReferences(block, definitions);
+                    this.styleNativeFootnotes(block, definitions);
                 }
 
                 if (tooltipId) {
@@ -1093,110 +1234,129 @@ export default class FootnoteJumperPlugin extends Plugin {
 
     private collectDefinitions(root: HTMLElement) {
         const rootId = this.editorProtyles.get(root)?.block?.rootID;
-        const definitions = new Map<string, FootnoteDefinition>(this.documentDefinitions.get(rootId)?.definitions);
-        const blocks = Array.from(root.querySelectorAll<HTMLElement>("[data-node-id]"));
+        const blocks = Array.from(root.querySelectorAll<HTMLElement>("[data-node-id]"))
+            .filter((block) => !block.closest('[data-type="NodeBlockQueryEmbed"]'));
         const loadedIds = new Set(blocks.map((block) => block.dataset.nodeId));
         // Visible content is newer than the SQL index, including deleted/renamed definitions.
-        for (const [id, definition] of definitions) {
-            if (loadedIds.has(definition.blockId)) {
-                definitions.delete(id);
-            }
+        const candidates: DefinitionCandidate[] = [];
+        for (const definition of this.documentDefinitions.get(rootId)?.definitions.values() || []) {
+            candidates.push(...(definition.candidates || [definition])
+                .filter((candidate) => !loadedIds.has(candidate.blockId)));
         }
+        return this.indexBlockDefinitions(blocks, candidates);
+    }
 
+    private parseBlockDefinition(block: HTMLElement) {
+        if (block.closest('[data-type="NodeBlockQueryEmbed"]')) return undefined;
+        if (block.dataset.type && ["NodeParagraph", "NodeHeading"].indexOf(block.dataset.type) < 0) return undefined;
+        return parseDefinition(this.getVisibleText(block)) || this.orderedDefinitionBlocks.get(block);
+    }
+
+    private indexBlockDefinitions(blocks: HTMLElement[], candidates: DefinitionCandidate[] = []) {
+        for (const block of blocks) this.orderedDefinitionBlocks.delete(block);
+        const literals = blocks.map((block) => ({block, parsed: this.parseBlockDefinition(block)})).filter((item) => item.parsed);
+        if (!literals.length && !candidates.some((candidate) => !candidate.listId)) {
+            const first = blocks[0];
+            const editor = first?.closest<HTMLElement>(".protyle-wysiwyg");
+            const rootId = editor ? this.editorProtyles.get(editor)?.block?.rootID : undefined;
+            const cache = this.documentDefinitions.get(rootId)?.definitions;
+            const byId = new Map(blocks.map((block) => [block.dataset.nodeId, block]));
+            // Complete cached structure decides which list is terminal in a
+            // paged editor. Full-document conversion has a complete fragment.
+            const ordered = editor && cache ? Array.from(cache.values()).reduce<DefinitionCandidate[]>((all, note) =>
+                all.concat((note.candidates || [note]).filter((candidate) => candidate.listId)), [])
+                : first ? readOrderedDefinitions(editor || first.getRootNode() as DocumentFragment, rootId) : [];
+            for (const note of ordered) {
+                const block = byId.get(note.blockId);
+                if (!block) continue;
+                this.orderedDefinitionBlocks.set(block, {...note,
+                    id: block.getAttribute("custom-footnote-label") || note.id,
+                    content: this.getVisibleText(block).trim() || "空脚注"});
+            }
+        } else candidates = candidates.filter((candidate) => !candidate.listId);
         for (const block of blocks) {
-            const parsed = parseDefinition(this.getVisibleText(block));
+            const parsed = this.parseBlockDefinition(block);
             if (!parsed) {
                 continue;
             }
 
-            const definition: FootnoteDefinition = {
-                ...parsed,
-                blockId: block.dataset.nodeId,
-                element: block,
-            };
-            definitions.set(definition.id, definition);
+            candidates.push({...parsed, blockId: block.dataset.nodeId});
         }
-
+        const definitions = new Map<string, FootnoteDefinition>(indexDefinitions(candidates));
+        const elements = new Map(blocks.map((block) => [block.dataset.nodeId, block]));
+        for (const definition of definitions.values()) definition.element = elements.get(definition.blockId);
         return definitions;
     }
 
-    private wrapReferences(root: HTMLElement, definitions: Map<string, FootnoteDefinition>) {
-        const textNodes: Text[] = [];
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-            acceptNode: (node) => this.acceptReferenceTextNode(node, root),
-        });
-
-        while (walker.nextNode()) {
-            textNodes.push(walker.currentNode as Text);
-        }
-
-        for (const textNode of textNodes) {
-            this.wrapReferenceTextNode(textNode, definitions);
-        }
+    private definitionPreview(definition?: FootnoteDefinition) {
+        return definition?.candidates
+            ? `脚注编号 [^${definition.id}] 重复（${definition.candidates.length} 处）。点击标记可选择定义，或通过顶部菜单检查重复编号。`
+            : definition?.content || "未找到对应脚注定义";
     }
 
-    private acceptReferenceTextNode(node: Node, block: HTMLElement) {
-        const text = node.textContent || "";
-        if (!text.includes("[^")) {
-            return NodeFilter.FILTER_REJECT;
-        }
-
-        const parent = node.parentElement;
-        if (!parent) {
-            return NodeFilter.FILTER_REJECT;
-        }
-
-        if (parent.closest(`.${REF_CLASS}, .${DEF_CLASS}, [${ENHANCED_ATTR}], [data-type~="${NATIVE_BLOCK_REF_TYPE}"], [data-type~="code"], code, pre, style, script, textarea, input`)) {
-            return NodeFilter.FILTER_REJECT;
-        }
-
-        if (!parent.closest(".protyle-wysiwyg")) {
-            return NodeFilter.FILTER_REJECT;
-        }
-
-        if (parent.closest("[data-node-id]") !== block) {
-            return NodeFilter.FILTER_REJECT;
-        }
-
-        return NodeFilter.FILTER_ACCEPT;
-    }
-
-    private wrapReferenceTextNode(textNode: Text, definitions: Map<string, FootnoteDefinition>) {
-        const text = textNode.nodeValue || "";
-        const regex = /\[\^([^\]\s:]+)\]/g;
-        let match: RegExpExecArray | null;
-        let lastIndex = 0;
-        const fragment = document.createDocumentFragment();
-        let changed = false;
-
-        while ((match = regex.exec(text)) !== null) {
-            changed = true;
-            const [raw, id] = match;
-            if (match.index > lastIndex) {
-                fragment.append(document.createTextNode(text.slice(lastIndex, match.index)));
-            }
-
-            const definition = definitions.get(id);
-            const refElement = document.createElement("span");
-            refElement.className = definition ? REF_CLASS : `${REF_CLASS} ${MISSING_CLASS}`;
-            refElement.textContent = raw;
-            refElement.dataset.footnoteId = id;
-            refElement.dataset.preview = definition ? definition.content : "未找到对应脚注定义";
-            refElement.setAttribute(ENHANCED_ATTR, "true");
-            refElement.setAttribute("contenteditable", "false");
-            fragment.append(refElement);
-
-            lastIndex = match.index + raw.length;
-        }
-
-        if (!changed) {
+    private async checkDuplicateDefinitions() {
+        const editor = getActiveEditor()?.protyle;
+        const rootId = editor?.block?.rootID;
+        if (!rootId || !editor.wysiwyg?.element) {
+            showMessage("请先打开需要检查的文档", 3000, "error");
             return;
         }
-
-        if (lastIndex < text.length) {
-            fragment.append(document.createTextNode(text.slice(lastIndex)));
+        this.registerEditor(editor);
+        try {
+            const blocks = await this.readDocumentBlocks(rootId, editor.wysiwyg.element);
+            if (this.unloaded || getActiveEditor()?.protyle !== editor) return;
+            const duplicates = Array.from(this.indexBlockDefinitions(blocks).values())
+                .filter((definition) => definition.candidates);
+            if (!duplicates.length) {
+                showMessage("全文未发现重复脚注编号");
+                return;
+            }
+            this.openDuplicateMenu(duplicates, this.topBarElement);
+        } catch (error) {
+            console.warn(`[${this.name}] check duplicates failed`, error);
+            showMessage(error instanceof Error && error.message === TABLE_EDIT_MESSAGE
+                ? TABLE_EDIT_MESSAGE : "读取全文失败，请重试", 4000, "error");
         }
-        textNode.parentNode?.replaceChild(fragment, textNode);
+    }
+
+    private openDuplicateMenu(definitions: FootnoteDefinition[], anchor?: HTMLElement) {
+        const menu = new Menu("siyuan-footnote-duplicates");
+        const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+        for (const definition of definitions) {
+            for (const candidate of definition.candidates || []) {
+                menu.addItem({
+                    label: escape(`[^${definition.id}] · ${candidate.content.slice(0, 60)}`),
+                    icon: "iconLink",
+                    click: () => {
+                        if (this.unloaded) return;
+                        this.hideTooltip();
+                        void this.openBlock(candidate.blockId).catch(() =>
+                            showMessage("定位脚注失败，请重试", 3000, "error"));
+                    },
+                });
+            }
+        }
+        const rect = anchor?.getBoundingClientRect();
+        menu.open({x: rect?.left || 0, y: rect?.bottom || 0});
+    }
+
+    private wrapReferences(root: HTMLElement, definitions: Map<string, FootnoteDefinition>) {
+        if (root.classList.contains(DEF_CLASS) || !root.closest(".protyle-wysiwyg")) return;
+        visitInline(root, (nodes) => {
+            const matches = readMarkers(nodes);
+            for (const match of matches.reverse()) {
+                const definition = definitions.get(match[1]);
+                const reference = document.createElement("span");
+                reference.className = definition?.candidates ? REF_CLASS + " " + CONFLICT_CLASS
+                    : definition ? REF_CLASS : REF_CLASS + " " + MISSING_CLASS;
+                reference.dataset.footnoteId = match[1];
+                reference.dataset.preview = this.definitionPreview(definition);
+                reference.setAttribute(ENHANCED_ATTR, "true");
+                reference.setAttribute("contenteditable", "false");
+                wrapTextRun(nodes, match.index, match.index + match[0].length, reference);
+            }
+        });
     }
 
     private cleanupEnhancements() {
@@ -1210,7 +1370,7 @@ export default class FootnoteJumperPlugin extends Plugin {
                 if (!parent) {
                     continue;
                 }
-                parent.replaceChild(document.createTextNode(ref.textContent || ""), ref);
+                ref.replaceWith(...Array.from(ref.childNodes));
                 parent.normalize();
             }
 
@@ -1219,12 +1379,20 @@ export default class FootnoteJumperPlugin extends Plugin {
                 definition.classList.remove(DEF_CLASS, HIGHLIGHT_CLASS);
                 delete definition.dataset.footnoteId;
             }
+            for (const native of Array.from(document.querySelectorAll<HTMLElement>(`.${NATIVE_REF_CLASS}`))) {
+                native.classList.remove(NATIVE_REF_CLASS);
+                if (!native.className) native.removeAttribute("class");
+            }
         } finally {
             this.isRendering = previousRenderingState;
         }
     }
 
     private cleanupBlock(block: HTMLElement) {
+        for (const native of Array.from(block.querySelectorAll<HTMLElement>(`.${NATIVE_REF_CLASS}`))) {
+            native.classList.remove(NATIVE_REF_CLASS);
+            if (!native.className) native.removeAttribute("class");
+        }
         const refs = Array.from(block.querySelectorAll<HTMLElement>(`.${REF_CLASS}[${ENHANCED_ATTR}]`))
             .filter((ref) => ref.closest("[data-node-id]") === block);
 
@@ -1233,7 +1401,7 @@ export default class FootnoteJumperPlugin extends Plugin {
             if (!parent) {
                 continue;
             }
-            parent.replaceChild(document.createTextNode(ref.textContent || ""), ref);
+            ref.replaceWith(...Array.from(ref.childNodes));
             parent.normalize();
         }
 
@@ -1247,8 +1415,34 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     private registerEditor(protyle: IProtyle) {
+        if (protyle?.wysiwyg?.element?.closest("[data-footnote-sidebar]")) return;
         if (protyle?.wysiwyg?.element) {
+            const element = protyle.wysiwyg.element;
+            if (!this.editorProtyles.has(element)) {
+                const rootId = protyle.block?.rootID;
+                if (rootId) {
+                    this.blockRootIds.set(rootId, rootId);
+                    for (const block of Array.from(element.querySelectorAll<HTMLElement>("[data-node-id]"))) {
+                        this.blockRootIds.set(block.dataset.nodeId, rootId);
+                    }
+                }
+            }
             this.editorProtyles.set(protyle.wysiwyg.element, protyle);
+        }
+    }
+
+    private styleNativeFootnotes(block: HTMLElement, definitions: Map<string, FootnoteDefinition>) {
+        const targetIds = new Set<string>();
+        for (const definition of definitions.values()) {
+            for (const candidate of definition.candidates || [definition]) {
+                targetIds.add(candidate.blockId);
+                if (candidate.itemId) targetIds.add(candidate.itemId);
+            }
+        }
+        for (const native of Array.from(block.querySelectorAll<HTMLElement>('[data-type~="block-ref"]'))) {
+            if (native.closest("[data-node-id]") !== block
+                || native.closest('[data-type="NodeBlockQueryEmbed"], [data-type~="code"], code, pre')) continue;
+            if (targetIds.has(native.dataset.id)) native.classList.add(NATIVE_REF_CLASS);
         }
     }
 
@@ -1269,19 +1463,37 @@ export default class FootnoteJumperPlugin extends Plugin {
                 throw new Error(response.msg || "Unable to read footnote definitions");
             }
             return response.data;
+        }, async () => {
+            const response = await fetchSyncPost("/api/block/getBlockDOM", {id: rootId});
+            if (response.code !== 0 || typeof response.data?.dom !== "string") return [];
+            const template = document.createElement("template");
+            template.innerHTML = response.data.dom;
+            const blocks = new Map(Array.from(template.content.querySelectorAll<HTMLElement>("[data-node-id]"))
+                .map((block) => [block.dataset.nodeId, block]));
+            return readOrderedDefinitions(template.content, rootId).map((note) => {
+                const block = blocks.get(note.blockId);
+                return {...note, id: block.getAttribute("custom-footnote-label") || note.id};
+            });
         }).then((definitions) => {
             if (this.unloaded || this.documentDefinitions.get(rootId) !== current) {
                 return;
             }
             current.definitions = definitions;
+            for (const definition of definitions.values()) {
+                for (const candidate of definition.candidates || [definition]) {
+                    this.blockRootIds.set(candidate.blockId, rootId);
+                    if (candidate.itemId) this.blockRootIds.set(candidate.itemId, rootId);
+                }
+            }
             // An interaction may query before the asynchronous SQL index catches
             // up. Let the scheduled post-edit refresh replace that early result.
             const now = Date.now();
-            current.expiresAt = now < this.definitionRefreshAfter
-                ? this.definitionRefreshAfter
+            const refreshAfter = this.definitionRefreshAfter.get(rootId) || 0;
+            current.expiresAt = now < refreshAfter
+                ? refreshAfter
                 : now + 30000;
             if (this.enabled) {
-                this.markAllBlocksDirty();
+                this.definitionDirtyRoots.add(rootId);
                 this.scheduleRefresh(0);
             }
         }).catch((error) => {
@@ -1324,6 +1536,10 @@ export default class FootnoteJumperPlugin extends Plugin {
             if (!this.unloaded && this.enabled && refElement.isConnected) {
                 showMessage(`未找到脚注 [^${id}] 的定义`);
             }
+            return;
+        }
+        if (definition.candidates) {
+            this.openDuplicateMenu([definition], refElement);
             return;
         }
         this.hideTooltip();
@@ -1457,9 +1673,10 @@ export default class FootnoteJumperPlugin extends Plugin {
                 if (this.activeTooltipRef !== refElement || !definition) {
                     return;
                 }
-                refElement.dataset.preview = definition.content;
+                refElement.dataset.preview = this.definitionPreview(definition);
                 refElement.classList.remove(MISSING_CLASS);
-                this.updateTooltipContent(definition.content);
+                refElement.classList[definition.candidates ? "add" : "remove"](CONFLICT_CLASS);
+                this.updateTooltipContent(refElement.dataset.preview);
                 this.positionTooltip(refElement);
             });
         }

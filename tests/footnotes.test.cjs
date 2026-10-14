@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const ts = require("typescript");
+const {parseHTML} = require("linkedom");
 
 // Exercise the actual TypeScript with a small SiYuan host double. No running
 // kernel or writes to a user's notes are needed for these regression cases.
@@ -92,7 +93,8 @@ function host(query = async () => []) {
             return {nextNode() {this.currentNode = nodes[index++]; return !!this.currentNode;}};
         },
     };
-    const Plugin = loadSource("index.ts", {siyuan: api, "./definitions": definitions, "./index.scss": {}}, {
+    const Plugin = loadSource("index.ts", {siyuan: api, "./definitions": definitions, "./inline": loadSource("inline.ts", {}),
+        "./manager": {FootnoteManager: class {}}, "./index.scss": {}}, {
         window, document, Date: HostDate, Node: Element, HTMLElement: Element, NodeFilter: {SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2},
     }).default;
     const plugin = new Plugin();
@@ -112,9 +114,20 @@ function host(query = async () => []) {
         reference.dataset.footnoteId = id;
         return reference;
     };
-    return {plugin, addEditor, ref, opens, messages, timers, api, calls: () => calls,
+    return {plugin, document, addEditor, ref, opens, messages, timers, api, calls: () => calls,
         runTimer: (id) => { if (id && !cancelledTimers.has(id)) timers[id - 1](); },
         advanceTime: (ms) => { now += ms; }};
+}
+
+function realEditor(h, rootID, html = "") {
+    const {document} = parseHTML('<html><body><div class="protyle-wysiwyg"></div></body></html>');
+    h.document.createElement = document.createElement.bind(document);
+    h.document.createTextNode = document.createTextNode.bind(document);
+    const editor = h.addEditor(rootID);
+    editor.element = editor.protyle.wysiwyg.element = document.querySelector(".protyle-wysiwyg");
+    editor.element.innerHTML = html;
+    h.plugin.registerEditor(editor.protyle);
+    return editor;
 }
 
 test("parse literal definitions, including multiline and empty content", () => {
@@ -177,17 +190,15 @@ test("same footnote numbers stay scoped to their own document", async () => {
 
 test("dynamic paging marks newly added blocks without discarding the document index", async () => {
     const h = host(async () => [{id: "tail", content: "[^1]: cached"}]);
-    const editor = h.addEditor("document");
+    const editor = realEditor(h, "document");
     await h.plugin.ensureDocumentDefinitions("document");
-    const added = new Element("new [^1]", "new-body");
-    added.editor = editor.element;
-    editor.element.blocks.push(added);
+    editor.element.innerHTML = '<div data-node-id="new-body" data-type="NodeParagraph"><div contenteditable="true">new [^1]</div></div>';
+    const added = editor.element.firstElementChild;
     h.plugin.handleProtyleLoaded({detail: {protyle: editor.protyle}});
     assert.equal(h.plugin.dirtyBlocks.has(added), true);
     assert.equal(h.plugin.findDefinition("1", h.ref(editor, "1")).blockId, "tail");
-    added.textNodes = [{textContent: "new [^1]", nodeValue: "new [^1]", parentElement: added, parentNode: added}];
     h.plugin.wrapReferences(added, h.plugin.collectDefinitions(editor.element));
-    const wrapped = added.replacement.children[1];
+    const wrapped = added.querySelector(".siyuan-footnote-ref");
     assert.equal(wrapped.dataset.footnoteId, "1");
     assert.equal(wrapped.dataset.preview, "cached");
     assert.equal(wrapped.className, "siyuan-footnote-ref");
@@ -239,16 +250,13 @@ test("disabled or unloaded plugins do not navigate after an asynchronous lookup"
 
 test("native reference conversion also accepts definitions that are not loaded", async () => {
     const h = host(async () => [{id: "tail", content: "[^1]: note"}]);
-    const editor = h.addEditor("A");
+    const editor = realEditor(h, "A", '<div data-node-id="body" data-type="NodeParagraph"><div contenteditable="true"><span class="siyuan-footnote-ref" data-siyuan-footnote-enhanced="true" data-footnote-id="1">[^1]</span></div></div>');
     await h.plugin.ensureDocumentDefinitions("A");
-    const enhanced = h.ref(editor, "1");
-    const block = new Element("body", "body");
-    enhanced.closest = () => block;
-    enhanced.replaceWith = (replacement) => {enhanced.replacement = replacement;};
-    block.blocks.push(enhanced);
+    const block = editor.element.firstElementChild;
     assert.equal(h.plugin.convertFootnoteMarkersToNativeRefs(block, h.plugin.collectDefinitions(editor.element)), 1);
-    assert.equal(enhanced.replacement.dataset.id, "tail");
-    assert.equal(enhanced.replacement.dataset.type, "block-ref");
+    const reference = block.querySelector('[data-type="block-ref"]');
+    assert.equal(reference.dataset.id, "tail");
+    assert.equal(reference.textContent, "[1]");
 });
 
 test("exact page boundaries and non-definition candidates do not lose footnotes", async () => {
@@ -355,15 +363,13 @@ test("refresh pauses document queries and rendering during Chinese composition",
 
 test("existing native block references and code do not get wrapped again", () => {
     const h = host();
-    const editor = h.addEditor("document");
+    const editor = realEditor(h, "document");
     for (const type of ["block-ref", "code"]) {
-        const body = new Element("[^1]", "body");
-        body.editor = editor.element;
-        const parent = new Element();
-        parent.closest = (selector) => selector.includes(`[data-type~="${type}"]`) ? parent : null;
-        body.textNodes = [{textContent: "[^1]", nodeValue: "[^1]", parentElement: parent, parentNode: body}];
+        editor.element.innerHTML = `<div data-node-id="body" data-type="NodeParagraph"><div contenteditable="true"><span data-type="${type}">[^1]</span></div></div>`;
+        const body = editor.element.firstElementChild;
         h.plugin.wrapReferences(body, new Map());
-        assert.equal(body.replacement, undefined);
+        assert.equal(body.querySelector(".siyuan-footnote-ref"), null);
+        assert.equal(body.textContent, "[^1]");
     }
 });
 

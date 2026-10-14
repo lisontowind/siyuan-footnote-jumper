@@ -21,6 +21,7 @@ module.exports = (env, argv) => {
         plugins.push(new CopyPlugin({
             patterns: [
                 {from: "README.md", to: "./dist/"},
+                {from: "CHANGELOG.md", to: "./dist/"},
                 {from: "LICENSE", to: "./dist/"},
                 {from: "plugin.json", to: "./dist/"},
                 {from: "icon.png", to: "./dist/"},
