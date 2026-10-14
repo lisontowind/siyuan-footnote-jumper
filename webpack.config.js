@@ -26,6 +26,7 @@ module.exports = (env, argv) => {
                 {from: "plugin.json", to: "./dist/"},
                 {from: "icon.png", to: "./dist/"},
                 {from: "preview.png", to: "./dist/"},
+                {from: "assets/guide", to: "./dist/assets/guide/"},
             ],
         }));
         plugins.push(new ZipPlugin({
