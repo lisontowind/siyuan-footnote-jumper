@@ -93,7 +93,8 @@ function host(query = async () => []) {
             return {nextNode() {this.currentNode = nodes[index++]; return !!this.currentNode;}};
         },
     };
-    const Plugin = loadSource("index.ts", {siyuan: api, "./definitions": definitions, "./inline": loadSource("inline.ts", {}),
+    const editing = loadSource("editing.ts", {siyuan: api, "./document": {}}, {document, window});
+    const Plugin = loadSource("index.ts", {siyuan: api, "./definitions": definitions, "./inline": loadSource("inline.ts", {}), "./editing": editing,
         "./manager": {FootnoteManager: class {}}, "./index.scss": {}}, {
         window, document, Date: HostDate, Node: Element, HTMLElement: Element, NodeFilter: {SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2},
     }).default;

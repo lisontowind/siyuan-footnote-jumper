@@ -76,6 +76,35 @@ export function cleanFootnoteDOM(root: HTMLElement | DocumentFragment) {
     root.normalize();
 }
 
+/** Compare content across native editing copies without view/save metadata.
+ * Keep IDs, hierarchy, rich text, reference targets and custom attributes. */
+export function documentContentSignature(dom: string | DocumentFragment) {
+    let root: DocumentFragment;
+    if (typeof dom === "string") {
+        const template = document.createElement("template");
+        template.innerHTML = dom;
+        root = template.content;
+    } else root = dom;
+    const ignored = new Set(["updated", "data-node-index", "data-render", "contenteditable", "spellcheck"]);
+    const visit = (node: Node): unknown => {
+        if (node.nodeType === 3) return node.textContent;
+        if (node.nodeType !== 1) return undefined;
+        const element = node as HTMLElement;
+        if (element.tagName === "WBR" || element.classList.contains("protyle-attr")) return undefined;
+        const attributes = Array.from(element.attributes).filter((attribute) => !ignored.has(attribute.name))
+            .map((attribute) => {
+                let value = attribute.value;
+                if (attribute.name === "class") value = value.split(/\s+/)
+                    .filter((name) => name && [NATIVE_REF_CLASS, "siyuan-footnote-definition",
+                        "siyuan-footnote-definition--highlight", "protyle-wysiwyg--select"].indexOf(name) < 0).sort().join(" ");
+                return [attribute.name, value];
+            }).filter(([name, value]) => name !== "class" || value)
+            .sort((a, b) => a[0].localeCompare(b[0]));
+        return [element.tagName, attributes, Array.from(element.childNodes, visit).filter((child) => child !== undefined)];
+    };
+    return JSON.stringify(Array.from(root.childNodes, visit).filter((child) => child !== undefined));
+}
+
 export function isFootnoteBlock(block: HTMLElement) {
     return BLOCK_TYPES.indexOf(block.dataset.type) >= 0
         && !block.closest('[data-type="NodeBlockQueryEmbed"]');
@@ -214,7 +243,12 @@ export function buildDocumentSnapshot(rootId: string, dom: string, overlays: HTM
             if (ignoredTargets.has(native.dataset.id)) return;
             // SiYuan can reference either a list item or its definition paragraph.
             // The displayed anchor may be [1], [^1], or a native dynamic anchor.
-            const target = byTarget.get(native.dataset.id);
+            const anchor = native.textContent?.trim();
+            // Older conversions could save a native anchor while its target was
+            // temporarily deleted. Repair only empty targets with an exact label.
+            const orphanLabel = !native.dataset.id && anchor?.match(/^\[\^?([^\]\s:]+)\]$/)?.[1];
+            const recovered = orphanLabel && byLabel.get(orphanLabel);
+            const target = byTarget.get(native.dataset.id) || (recovered?.length === 1 ? recovered[0] : undefined);
             const marker = native.textContent?.trim().match(/^\[\^([^\]\s:]+)\]$/);
             // A marker-shaped broken native ref is diagnosable; arbitrary refs stay native.
             if (!target && !marker) return;
@@ -274,7 +308,7 @@ export function prepareNormalization(snapshot: DocumentSnapshot, options: Normal
             if (kind === "block") {
                 // Unwrapping a terminal list removes its item IDs. Point native
                 // refs at the preserved paragraph before those items disappear.
-                if (options.definitionFormat === "literal" && note.listId) ref.native.dataset.id = note.blockId;
+                if (!ref.native.dataset.id || options.definitionFormat === "literal" && note.listId) ref.native.dataset.id = note.blockId;
                 ref.native.dataset.subtype = "s";
                 ref.native.textContent = `[${label}]`;
             } else ref.native.replaceWith(replacement);
@@ -361,7 +395,7 @@ function normalizeDefinitionLayout(snapshot: DocumentSnapshot, options: Normaliz
         const block = blocks.get(note.blockId);
         let ancestor = block.parentElement;
         while (ancestor) {
-            if (["NodeListItem", "NodeList"].indexOf(ancestor.dataset.type) >= 0) touchedContainers.add(ancestor);
+            if (["NodeListItem", "NodeList", "NodeBlockquote", "NodeSuperBlock"].indexOf(ancestor.dataset.type) >= 0) touchedContainers.add(ancestor);
             ancestor = ancestor.parentElement;
         }
         const nodes = textNodes(block);
@@ -430,12 +464,28 @@ function normalizeDefinitionLayout(snapshot: DocumentSnapshot, options: Normaliz
     original.forEach((old, i) => {
         const next = afterById.get(old.id);
         if (!next) undo.push({action: "insert", id: old.id, data: old.html, parentID: snapshot.rootId,
-            previousID: original[i - 1]?.id, nextID: i === 0 ? original[i + 1]?.id : undefined});
+            previousID: original[i - 1]?.id,
+            nextID: i === 0 ? original.slice(1).find((block) => afterById.has(block.id))?.id : undefined});
         else if (next.outerHTML !== old.html) undo.push({action: "update", id: old.id, data: old.html});
     });
     if (surviving.join() !== reordered.join()) original.forEach((old, i) => undo.push({action: "move", id: old.id,
         parentID: snapshot.rootId, previousID: original[i - 1]?.id}));
-    return {forward, undo, mapping, referenceCount: snapshot.references.length};
+    const originalDOM = document.createElement("template");
+    originalDOM.innerHTML = original.map((block) => block.html).join("");
+    return {forward: writeReferencesLast(forward, snapshot.container),
+        undo: writeReferencesLast(undo, originalDOM.content), mapping, referenceCount: snapshot.references.length};
+}
+
+function writeReferencesLast(operations: IOperation[], desired: DocumentFragment) {
+    if (!operations.length) return operations;
+    const references = Array.from(desired.querySelectorAll<HTMLElement>("[data-node-id]"))
+        .filter((block) => isFootnoteBlock(block) && block.querySelector('[data-type~="block-ref"]'));
+    const ids = new Set(references.map((block) => block.dataset.nodeId));
+    // The kernel validates block-ref targets when parsing each operation, even
+    // inside a single transaction. Restore all targets before parsing anchors.
+    // Reapply leaf refs inside inserted/updated containers for the same reason.
+    return operations.filter((operation) => operation.action !== "update" || !ids.has(operation.id))
+        .concat(references.map((block) => ({action: "update", id: block.dataset.nodeId, data: block.outerHTML})));
 }
 
 export function nextFootnoteLabel(snapshot: DocumentSnapshot) {
@@ -469,7 +519,8 @@ export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, s
     const definitionId = newId();
     const oldHTML = source.outerHTML;
     replaceTextRun(nodes, start, end, createNativeReference(label, definitionId));
-    const forward: IOperation[] = [{action: "update", id: sourceId, data: source.outerHTML}];
+    const referenceUpdate: IOperation = {action: "update", id: sourceId, data: source.outerHTML};
+    const forward: IOperation[] = [];
     const undo: IOperation[] = [{action: "update", id: sourceId, data: oldHTML}];
     const makeBlock = (id: string, heading: boolean, text: string) => {
         const block = document.createElement("div");
@@ -505,7 +556,7 @@ export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, s
         item.append(action, block); list.append(item);
         forward.push({action: "update", id: list.dataset.nodeId, data: list.outerHTML});
         undo.unshift({action: "update", id: list.dataset.nodeId, data: oldList});
-        return {forward, undo, mapping: [], referenceCount: 1, label, definitionId};
+        return {forward: [...forward, referenceUpdate], undo, mapping: [], referenceCount: 1, label, definitionId};
     }
     // Reuse only a terminal top-level h2 section: no later h1/h2 ends it.
     let section = -1;
@@ -525,7 +576,64 @@ export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, s
         insert(headingId, makeBlock(headingId, true, "脚注"));
     }
     insert(definitionId, makeBlock(definitionId, false, `[^${label}]: `));
-    return {forward, undo, mapping: [], referenceCount: 1, label, definitionId};
+    return {forward: [...forward, referenceUpdate], undo, mapping: [], referenceCount: 1, label, definitionId};
+}
+
+/** Apply normalization to loaded blocks before submitting the host transaction.
+ * SiYuan leaves the active update and ordinary-editor deletes/moves to callers.
+ * Missing insertion anchors belong to the kernel's unloaded document region. */
+export function applyNormalizationToEditor(root: HTMLElement, transaction: FootnoteTransaction, rootId: string) {
+    const find = (id: string) => Array.from(root.querySelectorAll<HTMLElement>("[data-node-id]"))
+        .find((block) => block.dataset.nodeId === id && !block.closest('[data-type="NodeBlockQueryEmbed"]'));
+    // Validate before making any changes, including operations for unloaded blocks.
+    const parsed = new Map<IOperation, HTMLElement>();
+    for (const operation of transaction.forward) {
+        if (operation.action !== "update" && operation.action !== "insert") continue;
+        const template = document.createElement("template");
+        template.innerHTML = operation.data;
+        const element = template.content.firstElementChild as HTMLElement;
+        if (template.content.childElementCount !== 1 || element?.dataset.nodeId !== operation.id) {
+            throw new Error("脚注事务内容无效，请重新整理");
+        }
+        parsed.set(operation, element);
+    }
+    const restore: (() => void)[] = [];
+    const remember = (element: HTMLElement) => {
+        const parent = element.parentNode, next = element.nextSibling;
+        restore.push(() => parent.insertBefore(element, next?.parentNode === parent ? next : null));
+    };
+    const rollback = () => {for (const undo of restore.slice().reverse()) undo();};
+    try {
+        for (const operation of transaction.forward) {
+            const existing = find(operation.id);
+            if (operation.action === "delete") {
+                if (existing) {remember(existing); existing.remove();}
+            } else if (operation.action === "update") {
+                if (!existing) continue;
+                const replacement = parsed.get(operation);
+                restore.push(() => replacement.replaceWith(existing));
+                existing.replaceWith(replacement);
+            } else if (operation.action === "insert" || operation.action === "move") {
+                if (operation.action === "insert" && existing) continue;
+                const element = operation.action === "move" ? existing : parsed.get(operation);
+                if (!element) continue;
+                const previous = operation.previousID && find(operation.previousID);
+                const next = operation.nextID && find(operation.nextID);
+                const parent = operation.parentID === rootId ? find(rootId) || root : find(operation.parentID);
+                // Do not append after a predecessor which is currently unloaded.
+                if (operation.previousID ? !previous : operation.nextID ? !next : !parent) continue;
+                if (existing) remember(existing);
+                else restore.push(() => element.remove());
+                if (previous) previous.after(element);
+                else if (next) next.before(element);
+                else {
+                    const first = Array.from(parent.children).find((child) => child.hasAttribute("data-node-id"));
+                    parent.insertBefore(element, first || null);
+                }
+            }
+        }
+    } catch (error) {rollback(); throw error;}
+    return {rollback};
 }
 
 /** Materialize the editing copy before SiYuan submits the atomic transaction.

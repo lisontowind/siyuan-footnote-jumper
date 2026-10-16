@@ -1,6 +1,7 @@
 import {confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Menu, openMobileFileById, openTab, Plugin, showMessage} from "siyuan";
 import {DefinitionCandidate, indexDefinitions, parseDefinition, readDocumentDefinitions, readOrderedDefinitions, StoredDefinition} from "./definitions";
 import {FootnoteManager} from "./manager";
+import {flushDocumentEdits, TABLE_SAVE_MESSAGE} from "./editing";
 import {readMarkers, replaceTextRun, visitInline, wrapTextRun} from "./inline";
 import "./index.scss";
 
@@ -19,7 +20,7 @@ const NATIVE_REF_CLASS = "siyuan-footnote-native-ref";
 const ACTIVE_REFRESH_DELAY = 1000;
 const INACTIVE_REFRESH_DELAY = 200;
 const TOOLTIP_HIDE_DELAY = 300;
-const TABLE_EDIT_MESSAGE = "请先结束表格编辑并等待保存，再执行全文操作";
+const TABLE_EDIT_MESSAGE = TABLE_SAVE_MESSAGE;
 
 interface FootnoteSettings {
     enabled: boolean;
@@ -370,6 +371,8 @@ export default class FootnoteJumperPlugin extends Plugin {
             </symbol>
         `);
         this.footnoteManager = new FootnoteManager(this, {
+            jumpEnabled: () => this.enabled,
+            setJumpEnabled: (enabled) => this.setEnabled(enabled),
             navigate: async (blockId) => {
                 for (const editor of getAllEditor()) {
                     const element = editor?.protyle?.wysiwyg?.element;
@@ -485,6 +488,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         } catch (error) {
             console.warn(`[${this.name}] load settings failed`, error);
         }
+        this.footnoteManager?.updateJumpStyle(this.enabled);
     }
 
     private saveSettings() {
@@ -557,6 +561,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         }
 
         this.enabled = enabled;
+        this.footnoteManager?.updateJumpStyle(enabled);
         this.updateTopBarState();
         this.saveSettings();
 
@@ -683,6 +688,13 @@ export default class FootnoteJumperPlugin extends Plugin {
     }
 
     private async readDocumentBlocks(rootId: string, wysiwyg: HTMLElement) {
+        const editor = getAllEditor().find((item) => item.protyle?.wysiwyg?.element === wysiwyg);
+        if (editor && Array.from(wysiwyg.querySelectorAll<HTMLElement>('[data-type="NodeTable"]'))
+            .some((block) => block.dataset.type === "NodeTable")) await flushDocumentEdits([editor], () => {
+            if (this.unloaded || this.isComposing) throw new Error("请结束输入法组合输入后重试");
+            if (editor.protyle.block.rootID !== rootId) throw new Error("当前文档已切换，请重新执行");
+        }, (block) => this.isActiveBlock(block) || this.dirtyBlocks.has(block)
+            || Boolean(window.getSelection()?.anchorNode && block.contains(window.getSelection().anchorNode)));
         const response = await fetchSyncPost("/api/block/getBlockDOM", {id: rootId});
         if (response.code !== 0 || typeof response.data?.dom !== "string" || !response.data.dom.trim()) {
             throw new Error(response.msg || "Unable to read document DOM");
@@ -697,10 +709,6 @@ export default class FootnoteJumperPlugin extends Plugin {
         for (const block of Array.from(wysiwyg.querySelectorAll<HTMLElement>("[data-node-id]"))) {
             if (!this.isConvertibleBlock(block)) continue;
             if (block.dataset.type === "NodeTable") {
-                if (blocks.get(block.dataset.nodeId)?.textContent.includes("[^")
-                    && (this.isActiveBlock(block) || this.dirtyBlocks.has(block))) {
-                    throw new Error(TABLE_EDIT_MESSAGE);
-                }
                 continue;
             }
             const original = blocks.get(block.dataset.nodeId);

@@ -12,7 +12,7 @@ const hostStart = hostSource.indexOf("function setupHost(modules) {");
 const hostEnd = hostSource.indexOf("\n(async () =>", hostStart);
 assert.ok(hostStart >= 0 && hostEnd > hostStart, "Browser host was not found");
 const setupHost = new Function(`return (${hostSource.slice(hostStart, hostEnd).trim()});`)();
-const modules = Object.fromEntries(["inline", "definitions", "document", "sidebar", "manager", "index"].map(name => ["./" + name,
+const modules = Object.fromEntries(["inline", "definitions", "document", "editing", "sidebar", "manager", "index"].map(name => ["./" + name,
     ts.transpileModule(fs.readFileSync(path.join(root, "src", name + ".ts"), "utf8"), {
         compilerOptions: {target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS},
     }).outputText]));
@@ -39,17 +39,17 @@ const styles = `
     .preview{background:#f4f7fb;border:1px solid #dce4ef;border-radius:8px;margin-top:22px;padding:17px;font-size:20px;line-height:1.7;box-shadow:0 6px 18px #21395412}
     .return{margin-top:30px;display:inline-block;background:#f4f7fb;border:1px solid #cbd7e8;border-radius:7px;padding:10px 15px;font-size:18px}
     .callout{display:flex;gap:13px;margin:0 0 27px;align-items:flex-start}.callout .number{flex:none}.callout strong{font-size:24px;display:block;margin-bottom:9px}.callout p{font-size:20px;color:#63758a;line-height:1.7;margin:0}
-    #dock{width:500px;border:1px solid #dce4ef;border-radius:12px;overflow:hidden;height:840px;flex:none;background:#fff}
+    #dock{width:500px;border:1px solid #dce4ef;border-radius:12px;overflow:hidden;flex:none;background:#fff}
     .main{display:none}.block__icons{display:flex;align-items:center;padding:13px 15px;gap:8px;background:#f8fafd;border-bottom:1px solid #dce4ef}
     .block__logo{display:flex;align-items:center;font-weight:600;gap:5px}.fn__flex-1{flex:1}svg{width:18px;height:18px}.block__icon{cursor:pointer;background:transparent;border:0;color:#63758a}
     .b3-button{padding:7px 11px;border:1px solid #adc6f7;color:#3266cf;background:#fff;border-radius:5px;font:inherit}.b3-select{padding:4px;font:inherit;border:1px solid #cbd7e8;border-radius:4px}
-    .protyle-attr{display:none}[contenteditable]{outline:none}.siyuan-footnote-sidebar{font-size:17px!important}
-    .siyuan-footnote-sidebar__list{max-height:none!important}.siyuan-footnote-sidebar__status{font-size:15px!important}
-    .siyuan-footnote-sidebar__editor{height:120px!important}.siyuan-footnote-sidebar__tools{gap:10px!important}.siyuan-footnote-sidebar__references{gap:6px!important}
-    .siyuan-footnote-sidebar__note{padding:9px!important}.siyuan-footnote-sidebar__editor-title{padding:10px 12px!important}
-    .siyuan-footnote-sidebar small{font-size:14px}.siyuan-footnote-sidebar__reference small{font-size:15px}
-    .siyuan-footnote-sidebar__editor [data-node-id]{padding:15px 18px;line-height:1.8}
-    .pin{display:inline-grid;place-items:center;width:25px;height:25px;border-radius:50%;background:#3266cf;color:#fff;font:700 15px 'Segoe UI';margin-right:8px;vertical-align:middle}
+    .protyle-attr{display:none}[contenteditable]{outline:none}
+    /* Enlarge the complete live panel uniformly; keep its actual layout and typography. */
+    #dock.siyuan-footnote-sidebar{zoom:1.25;width:400px;height:auto}
+    .siyuan-footnote-sidebar__editor [data-node-id]{padding:8px 16px;line-height:1.8}
+    .pin{display:inline-grid;place-items:center;width:21px;height:21px;border-radius:50%;background:#3266cf;color:#fff;font:700 13px 'Segoe UI';margin-right:6px;vertical-align:middle;flex:none}
+    .siyuan-footnote-sidebar__display-toggle > span{display:flex;align-items:center}
+    .save-barrier{margin-top:24px;border:1px solid #e8ccaa;background:#fff8ee;color:#87551b;border-radius:10px;padding:18px 22px;font-size:20px;line-height:1.7}
 `;
 
 async function render(page, filename, html) {
@@ -82,10 +82,11 @@ async function render(page, filename, html) {
         await page.setContent(`<html lang="zh-CN"><meta charset="utf-8"><style>${styles}</style><div class="plate">
             <div class="eyebrow">02 / 脚注侧栏</div><h1>选中脚注，边读正文边编辑</h1><div class="subtitle">顶部脚注按钮 → “打开脚注侧栏”，或打开右侧“脚注”面板。</div>
             <div class="row"><div class="card" style="border:0;background:transparent;padding:24px 18px 0 0">
-                <div class="callout"><span class="number">1</span><div><strong>选择目标格式</strong><p>引用写法和定义格式独立选择；<br>需要整理时点击“统一格式”。</p></div></div>
-                <div class="callout"><span class="number">2</span><div><strong>查看脚注与引用次数</strong><p>点击列表选中脚注；还可查看<br>缺失、重复和未引用状态。</p></div></div>
-                <div class="callout"><span class="number">3</span><div><strong>直接编辑原脚注</strong><p>支持富文本，修改自动保存。<br>显式定义请保留编号前缀。</p></div></div>
-                <div class="callout"><span class="number">4</span><div><strong>定位被引段落</strong><p>查看正文摘要、上级标题与次数；<br>点击段落即可回到正文位置。</p></div></div>
+                <div class="callout"><span class="number">1</span><div><strong>切换脚注跳转样式</strong><p>与顶部菜单同步并记住设置；<br>关闭后块引仍可原生跳转。</p></div></div>
+                <div class="callout"><span class="number">2</span><div><strong>选择目标格式</strong><p>引用写法和定义格式独立选择；<br>需要整理时点击“统一格式”。</p></div></div>
+                <div class="callout"><span class="number">3</span><div><strong>查看脚注与引用次数</strong><p>点击列表选中脚注；还可查看<br>缺失、重复和未引用状态。</p></div></div>
+                <div class="callout"><span class="number">4</span><div><strong>直接编辑原脚注</strong><p>支持富文本，修改自动保存。<br>显式定义请保留编号前缀。</p></div></div>
+                <div class="callout"><span class="number">5</span><div><strong>定位被引段落</strong><p>查看段落数、正文摘要与引用次数；<br>点击段落即可回到正文位置。</p></div></div>
             </div><main class="main protyle-wysiwyg"></main><aside id="dock"></aside></div>
             <div class="footer">插件侧栏示例 · 实际外观随思源主题变化</div></div></html>`);
         await page.addStyleTag({content:fs.readFileSync(path.join(root,'dist','index.css'),'utf8')});
@@ -104,17 +105,25 @@ async function render(page, filename, html) {
         await page.locator('[data-note-key="a"]').click();
         await page.evaluate(() => {
             const mark = (selector, n) => {const node=document.querySelector(selector); const pin=document.createElement('span');pin.className='pin';pin.textContent=n;node.prepend(pin);};
-            mark('.siyuan-footnote-sidebar__tools label',1);
-            mark('[data-note-key="a"] strong',2);
-            mark('.siyuan-footnote-sidebar__editor-title',3);
-            mark('.siyuan-footnote-sidebar__references > strong',4);
+            mark('.siyuan-footnote-sidebar__display-toggle > span',1);
+            mark('.siyuan-footnote-sidebar__section-title',2);
+            mark('[data-note-key="a"] strong',3);
+            mark('.siyuan-footnote-sidebar__editor-title > strong',4);
+            mark('.siyuan-footnote-sidebar__references-heading > strong',5);
         });
         await page.evaluate(() => document.fonts.ready);
         await page.locator('.plate').screenshot({path:path.join(output,'02-sidebar.png')});
         const sidebarSize = await page.evaluate(() => ({scroll:document.querySelector('#dock').scrollHeight,client:document.querySelector('#dock').clientHeight}));
         assert.ok(sidebarSize.scroll <= sidebarSize.client + 2,`Sidebar must be fully visible: ${JSON.stringify(sidebarSize)}`);
+        const clippedSections = await page.evaluate(() => {
+            const dock = document.querySelector('#dock').getBoundingClientRect();
+            return Array.from(document.querySelectorAll('#dock select, #dock button, #dock input, #dock .pin'))
+                .filter(node => node.getClientRects().length && node.getBoundingClientRect().bottom > dock.bottom + 1)
+                .map(node => node.textContent || node.getAttribute('aria-label'));
+        });
+        assert.deepEqual(clippedSections, [], 'Sidebar controls and all five callouts must be visible');
 
-        await render(page,'03-navigation.png',`<div class="plate"><div class="eyebrow">03 / 文本标记的预览与跳转</div><h1>先预览，再跳转，读完回正文</h1><div class="subtitle">适用于文本标记 <code>[^编号]</code>；脚注块引沿用思源原生交互。</div>
+        await render(page,'03-navigation.png',`<div class="plate"><div class="eyebrow">03 / 文本标记的预览与跳转</div><h1>先预览，再跳转，读完回正文</h1><div class="subtitle">开启“脚注跳转样式”后适用于 <code>[^编号]</code>；块引沿用思源原生交互。</div>
             <div class="row">
                 <div class="card"><h2><span class="number">1</span>悬停预览</h2><div class="mock">概念需说明<span class="marker">[^1]</span><div class="preview"><div class="label">脚注内容</div>这里是补充说明。<br>长脚注可滚动，<br>也可选取文字。</div></div><p class="hint">不用先滚动到文末。</p></div>
                 <div class="arrow">→</div>
@@ -124,7 +133,7 @@ async function render(page, filename, html) {
             </div><div class="strip">文本标记与脚注块引都能预览。普通文本 <code>[1]</code> 不是块引，请用“插入脚注”或格式转换创建。</div><div class="footer">操作示意 · 上标样式由插件提供</div></div>`);
 
         await render(page,'04-normalize.png',`<div class="plate"><div class="eyebrow">04 / 统一格式</div><h1>按正文首次引用顺序，统一为 1、2、3…</h1><div class="subtitle">侧栏选择目标格式 → 点击“统一格式” → 核对影响范围与编号变化 → 确认。</div>
-            <div class="settings"><span>引用：静态块引</span><span>定义：文末有序列表</span><span>☑ 连续编号</span></div>
+            <div class="settings"><span>引用写法：静态块引</span><span>定义格式：文末有序列表</span><span>☑ 连续编号</span></div>
             <div class="row"><div class="card"><div class="label">整理前 · 显式定义 + 文本标记</div><div class="line">先提到乙 <code>[^8]</code>，再提到甲 <code>[^3]</code>。</div><div class="line">再次提到乙 <code>[^8]</code>。</div><div class="notes"><div><code>[^3]:</code> 甲的内容</div><div><code>[^8]:</code> 乙的内容</div><div><code>[^9]:</code> 未引用的内容</div></div></div><div class="arrow">→</div>
             <div class="card"><div class="label">整理后 · 静态块引 + 文末有序列表</div><div class="line">先提到乙 <span class="marker">[1]</span>，再提到甲 <span class="marker">[2]</span>。</div><div class="line">再次提到乙 <span class="marker">[1]</span>。</div><div class="notes"><div>1. 乙的内容</div><div>2. 甲的内容</div><div>3. 未引用的内容</div></div></div></div>
             <div class="strip">同一脚注的多处引用共用编号；未引用定义排在末尾。内容和富文本保留，可一次撤销恢复。</div><div class="footer">前后对照示意 · 引用与定义可独立选择，也可切回显式定义</div></div>`);
@@ -134,6 +143,14 @@ async function render(page, filename, html) {
             <div class="card"><h2><span class="number">2</span>列表重排后</h2><div class="mock">正文仍显示 <span class="marker">[1]</span><div class="notes"><div>1. 乙的内容</div><div>2. 甲的内容</div></div></div><p class="hint warning">序号已变化，请刷新序号</p><div class="menu">刷新序号 → 确认</div></div><div class="arrow">→</div>
             <div class="card"><h2><span class="number">3</span>显示编号更新</h2><div class="mock">正文引用甲 <span class="marker">[2]</span><div class="notes"><div>1. 乙的内容</div><div>2. 甲的内容</div></div></div><p class="hint success">仍指向甲，列表顺序不变。</p></div></div>
             <div class="strip">如果要按正文首次引用顺序重新排列并从 1 编号，请使用勾选“连续编号”的“统一格式”。</div><div class="footer">操作示意 · 静态块引的显示编号不会随列表重排自动变化</div></div>`);
-        console.log('Rendered 5 tutorial images in assets/guide/.');
+        await render(page,'06-save.png',`<div class="plate"><div class="eyebrow">06 / 表格编辑后整理</div><h1>自动结束表格编辑，保存后继续整理</h1><div class="subtitle">适用于“统一格式”“刷新序号”和“为脚注标记添加块引”等全文操作。</div>
+            <div class="row">
+                <div class="card"><h2><span class="number">1</span>发起操作</h2><div class="mock"><div class="note-title">刚在表格中编辑了引用</div>补充说明 <code>[^1]</code><div class="menu">点击“统一格式”</div></div><p class="hint">自动结束表格编辑选区，<br>通常无须手动移出表格。</p></div>
+                <div class="arrow">→</div>
+                <div class="card"><h2><span class="number">2</span>等待保存</h2><div class="mock"><div class="label">等待思源原生保存</div>读取完整表格，<br>核对保存状态。</div><p class="hint">包含尚未加载的表格行，<br>避免只处理屏幕中的内容。</p></div>
+                <div class="arrow">→</div>
+                <div class="card"><h2><span class="number">3</span>确认后执行</h2><div class="mock"><div class="note-title">核对范围、格式与编号</div>确认 → 完成整理<div class="menu">支持一次撤销恢复</div></div><p class="hint">确认期间内容若有变化，<br>需要重新检查并确认。</p></div>
+            </div><div class="save-barrier">保存失败或无法确认保存完成：停止操作并提示重试，等待保存后再试。<br>中文输入法：请先完成组合输入，再执行整理。</div><div class="footer">操作流程示意 · 不同思源版本的保存等待方式可能不同</div></div>`);
+        console.log('Rendered 6 tutorial images in assets/guide/.');
     } finally {await browser.close();}
 })().catch(error => {console.error(error);process.exitCode=1;});

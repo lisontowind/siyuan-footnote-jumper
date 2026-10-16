@@ -59,7 +59,9 @@ function host() {
             return {code: 0, data: typeof sqlRows === "function" ? await sqlRows(args.stmt) : sqlRows};
         },
     };
-    const Plugin = compile("index.ts", {siyuan: api, "./definitions": definitions, "./inline": compile("inline.ts", {}),
+    const model = compile("document.ts", {"./definitions": definitions, "./inline": compile("inline.ts", {})}, {document});
+    const editing = compile("editing.ts", {siyuan: api, "./document": model}, {document, window: hostWindow});
+    const Plugin = compile("index.ts", {siyuan: api, "./definitions": definitions, "./inline": compile("inline.ts", {}), "./editing": editing,
         "./manager": {FootnoteManager: class {}}, "./index.scss": {}}, {
         document, window: hostWindow, Date: HostDate, Node: window.Node, HTMLElement: window.HTMLElement,
         NodeFilter: {SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2},
@@ -187,7 +189,7 @@ test("embedded document text cannot supply definitions or enter a full-document 
     assert.equal(updates[0].referenceCount, 1);
 });
 
-test("virtualized tables use complete kernel rows; editing tables prevents stale overwrites", async () => {
+test("virtualized tables use complete kernel rows after native input is saved", async () => {
     const h = host();
     const table = (cells) => block("table", `<table><tbody>${cells}</tbody></table>`, "NodeTable");
     const row = (text) => `<tr><td>${text}</td></tr>`;
@@ -197,7 +199,11 @@ test("virtualized tables use complete kernel rows; editing tables prevents stale
     assert.equal(updates[0].referenceCount, 2);
     assert.match(updates[0].operation.data, /unloaded row/);
     h.plugin.activeBlock = editor.firstElementChild;
-    await assert.rejects(h.plugin.readDocumentBlocks("doc", editor), /结束表格编辑/);
+    let flushed = false;
+    h.api.getAllEditor()[0].flushPendingTransactions = async () => {flushed = true;};
+    const saved = await h.plugin.readDocumentBlocks("doc", editor);
+    assert.equal(flushed, true);
+    assert.match(saved.find(b => b.dataset.nodeId === "table").textContent, /unloaded row/);
     assert.equal(h.transactions.length, 0);
 });
 
@@ -310,6 +316,29 @@ test("native footnote styling keeps block identity and is removed from both tran
     h.plugin.cleanupEnhancements();
     assert.equal(body.querySelectorAll(".siyuan-footnote-native-ref").length, 0);
     assert.equal(body.querySelector('[data-id="def"]').textContent, "[^1]");
+});
+
+test("disabling jump restores text and native ref styles without changing native targets", () => {
+    const h = host();
+    const saved = [];
+    h.plugin.saveData = async (name, value) => {saved.push(value.enabled);};
+    const native = '<span class="host-ref" data-type="block-ref" data-subtype="s" data-id="def">[1]</span>';
+    const editor = h.addEditor("doc", block("body", `正文 [^1] ${native}`) + block("def", "[^1]: note"));
+    const body = editor.firstElementChild;
+    const original = body.innerHTML;
+    h.plugin.markAllBlocksDirty(); h.plugin.refresh();
+    assert.equal(body.querySelectorAll('.siyuan-footnote-ref, .siyuan-footnote-native-ref').length, 2);
+    h.plugin.setEnabled(false);
+    assert.equal(body.innerHTML, original);
+    h.plugin.markAllBlocksDirty(); h.plugin.refresh();
+    assert.equal(body.innerHTML, original);
+    assert.equal(body.querySelector('[data-type="block-ref"]').outerHTML, native);
+    h.plugin.setEnabled(true); h.plugin.refresh();
+    assert.equal(body.querySelectorAll('.siyuan-footnote-ref, .siyuan-footnote-native-ref').length, 2);
+    h.plugin.setEnabled(false);
+    assert.equal(body.innerHTML, original);
+    assert.deepEqual(saved, [false, true, false]);
+    assert.equal(h.transactions.length, 0);
 });
 
 test("native sidebar edits are excluded from transient enhancement and active-block tracking", () => {

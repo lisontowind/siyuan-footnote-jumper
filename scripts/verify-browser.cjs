@@ -9,7 +9,7 @@ const {chromium} = require(process.env.FOOTNOTE_PLAYWRIGHT || "playwright");
 const workspace = path.resolve(__dirname, "..");
 const artifacts = process.env.FOOTNOTE_BROWSER_ARTIFACTS || path.join(workspace, "dist", "browser-check");
 
-const modules = Object.fromEntries(["inline", "definitions", "document", "sidebar", "manager", "index"].map(name => ["./" + name,
+const modules = Object.fromEntries(["inline", "definitions", "document", "editing", "sidebar", "manager", "index"].map(name => ["./" + name,
     ts.transpileModule(fs.readFileSync(path.join(workspace, "src", name + ".ts"), "utf8"), {
         compilerOptions: {target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS},
     }).outputText]));
@@ -24,20 +24,28 @@ function setupHost(modules) {
     let id = 0;
     const find = (container, id) => Array.from(container.querySelectorAll("[data-node-id]")).find(node => node.dataset.nodeId === id);
     const apply = (container, operations, kernel) => {
+        const parse = html => {
+            const template = document.createElement("template"); template.innerHTML = html;
+            if (kernel) for (const anchor of template.content.querySelectorAll('[data-type~="block-ref"]')) {
+                // The real kernel clears anchors whose targets do not yet exist.
+                if (!find(container, anchor.dataset.id)) {anchor.dataset.id = ""; anchor.dataset.subtype = "";}
+            }
+            return template;
+        };
         for (const op of operations) {
             const existing = find(container, op.id);
-            if (op.action === "delete") existing?.remove();
+            if (op.action === "delete") {if (kernel) existing?.remove();}
             else if (op.action === "update") {
                 if (!existing) continue;
                 // SiYuan expects callers to update the currently edited block
                 // locally; transactions only refresh its other DOM copies.
                 const selection = getSelection();
                 if (!kernel && selection.rangeCount && existing.contains(selection.getRangeAt(0).startContainer)) continue;
-                const template = document.createElement("template"); template.innerHTML = op.data;
+                const template = parse(op.data);
                 existing.replaceWith(template.content);
             } else if (op.action === "insert") {
                 if (existing) continue;
-                const template = document.createElement("template"); template.innerHTML = op.data;
+                const template = parse(op.data);
                 const previous = find(container, op.previousID);
                 const next = find(container, op.nextID);
                 const parent = find(container, op.parentID) || container;
@@ -46,7 +54,7 @@ function setupHost(modules) {
                 if (previous) previous.after(template.content);
                 else if (next) next.before(template.content);
                 else if (kernel || !op.previousID) parent.append(template.content);
-            } else if (op.action === "move" && existing) {
+            } else if (op.action === "move" && existing && kernel) {
                 const previous = find(container, op.previousID);
                 const parent = find(container, op.parentID) || container;
                 if (previous) previous.after(existing);
@@ -127,11 +135,17 @@ function setupHost(modules) {
         off(name, cb) {h.listeners.get(name)?.delete(cb);}},
         addDock(options) {h.dock = options; options.init({element: document.querySelector("#dock")});}};
     h.manager = new (load("./manager").FootnoteManager)(h.plugin, {
+        jumpEnabled: () => h.jumper.enabled,
+        setJumpEnabled: enabled => h.jumper.setEnabled(enabled),
         navigate: async id => h.opened.push(id), tablePending: () => false, changed: () => {}});
     h.jumper = new (load("./index").default)();
+    h.jumper.footnoteManager = h.manager;
+    h.savedSettings = [];
+    h.jumper.saveData = async (name, value) => {h.savedSettings.push({...value});};
     h.mainElement.addEventListener("focusin", () => {h.active = h.main;});
     h.reset = async (html, loaded = html) => {
         id = 0;
+        h.manager.sidebar?.invalidateEditor();
         h.manager.previousLabels.clear();
         h.mainElement.innerHTML = loaded; h.kernel.innerHTML = html;
         h.active = h.main; h.transactions = []; h.confirmations = []; h.messages = [];
@@ -161,6 +175,43 @@ function setupHost(modules) {
         </style><main class="main protyle-wysiwyg"></main><aside id="dock"></aside></html>`);
         await page.addStyleTag({content: fs.readFileSync(path.join(workspace, "dist", "index.css"), "utf8")});
         await page.evaluate(setupHost, modules);
+
+        // Both controls share persisted state. Disabling restores text and
+        // native ref styles while preserving native targets and anchors.
+        await page.evaluate(async () => {
+            const native = '<span data-type="block-ref" data-subtype="s" data-id="d">[1]</span>';
+            await h.reset(h.block("body", `正文 [^1] ${native}`) + h.block("d", "[^1]: 内容"));
+            h.jumper.registerEditor(h.main.protyle);
+            h.jumper.markAllBlocksDirty(); h.jumper.refresh();
+            if (!h.mainElement.querySelector('.siyuan-footnote-ref')) throw Error("Text marker not enhanced");
+        });
+        await page.getByRole("switch", {name: "脚注跳转样式"}).uncheck();
+        await page.evaluate(async () => {
+            h.jumper.refresh();
+            if (h.jumper.enabled || h.savedSettings.at(-1).enabled) throw Error("Panel did not persist disabled state");
+            if (h.mainElement.querySelector('.siyuan-footnote-ref')) throw Error("Text marker still enhanced");
+            const anchor = h.mainElement.querySelector('[data-type="block-ref"]');
+            if (anchor.dataset.id !== "d" || anchor.dataset.subtype !== "s" || anchor.textContent !== "[1]") throw Error("Static target or anchor changed");
+            if (anchor.classList.contains('siyuan-footnote-native-ref')) throw Error("Native ref style was not restored");
+            const style = getComputedStyle(anchor);
+            if (style.verticalAlign !== "baseline" || style.borderBottomStyle !== "none"
+                || style.fontSize !== getComputedStyle(anchor.parentElement).fontSize) throw Error("Native ref still uses enhanced style");
+            // A later refresh must not reapply plugin styles while disabled.
+            h.mainElement.firstElementChild.querySelector('[contenteditable]').innerHTML += ' <span data-type="block-ref" data-subtype="s" data-id="d">[1]</span>';
+            h.jumper.markAllBlocksDirty(); h.jumper.refresh();
+            if (h.mainElement.querySelector('.siyuan-footnote-native-ref')) throw Error("Disabled style returned after refresh");
+            h.jumper.setEnabled(true);
+            h.jumper.refresh();
+            if (!h.mainElement.querySelector('.siyuan-footnote-ref')) throw Error("Text marker not restored");
+            if (h.mainElement.querySelectorAll('.siyuan-footnote-native-ref').length !== 2) throw Error("Native ref style not restored on enable");
+            if (!document.querySelector('[data-jump-style]').checked) throw Error("Menu state did not sync to panel");
+            if (!h.savedSettings.at(-1).enabled || h.transactions.length) throw Error("Toggle did not save cleanly");
+            await h.jumper.ensureDocumentDefinitions("doc");
+            window.clearTimeout(h.jumper.refreshTimer);
+            h.jumper.refreshTimer = 0; h.jumper.refreshTimerAt = 0;
+            h.jumper.dirtyBlocks.clear(); h.jumper.definitionDirtyRoots.clear();
+            h.nativeEditors.length = 0;
+        });
 
         // Exercise transient rich markers and caret restoration in a real DOM.
         await page.evaluate(() => {
@@ -197,7 +248,7 @@ function setupHost(modules) {
         const layout = await page.evaluate(() => ({width: document.querySelector("#dock").getBoundingClientRect().width,
             overflow: document.querySelector("#dock").scrollWidth > document.querySelector("#dock").clientWidth}));
         assert.equal(layout.width, 360); assert.equal(layout.overflow, false);
-        await page.screenshot({path: path.join(artifacts, "sidebar-desktop.png")});
+        await page.screenshot({path: path.join(artifacts, "sidebar-desktop.png"), animations: "disabled"});
         const nativeCount = await page.evaluate(() => h.nativeEditors.length);
         await page.locator('[data-note-key="b"]').click();
         await page.evaluate(() => h.manager.refresh());
@@ -210,6 +261,90 @@ function setupHost(modules) {
         await page.waitForFunction(() => h.transactions.length === 1);
         assert.match(await page.evaluate(() => h.kernel.innerHTML), /\[\^1\]: 第二个定义/);
         assert.match(await page.evaluate(() => h.kernel.innerHTML), /<b>保留加粗<\/b>/);
+
+        // End real table focus/selection, flush pending native input, and use
+        // the complete saved table instead of the partial visible row set.
+        await page.evaluate(async () => {
+            const table = text => h.block("table", `<table><tbody><tr><td contenteditable="true">${text} [^A]</td></tr><tr><td>未加载行 [^A]</td></tr></tbody></table>`, "NodeTable");
+            const html = text => h.block("body", "正文 [^A]") + table(text) + h.block("a", "[^A]: 内容");
+            await h.reset(html("旧内容"), html("新内容"));
+            h.mainElement.querySelectorAll('tr')[1].remove();
+            const cell = h.mainElement.querySelector('td');
+            const editable = h.mainElement.querySelector('[data-node-id="table"] [contenteditable="true"]');
+            editable.focus();
+            if (document.activeElement !== editable) throw Error("Table test did not focus its native editing root");
+            const range = document.createRange(); range.selectNodeContents(cell); range.collapse(false);
+            getSelection().removeAllRanges(); getSelection().addRange(range);
+            h.tableBlurred = false; editable.addEventListener("blur", () => {h.tableBlurred = true;});
+            h.manager.host.tablePending = () => true;
+            h.main.flushPendingTransactions = async () => {h.kernel.innerHTML = html("新内容");};
+            await h.manager.normalize({format: "block", renumber: true});
+            if (!h.tableBlurred || getSelection().rangeCount) throw Error("Table editing was not ended");
+            if (h.confirmations.length !== 1 || h.transactions.length) throw Error("Saved table did not reach review");
+            h.confirmations[0].callback();
+        });
+        await page.waitForFunction(() => h.transactions.length === 1);
+        await page.evaluate(() => {
+            const table = h.kernel.querySelector('[data-node-id="table"]');
+            if (!table.textContent.includes("新内容") || !table.textContent.includes("未加载行")
+                || table.querySelectorAll('[data-type="block-ref"]').length !== 2) throw Error("Table save or unloaded rows lost");
+            delete h.main.flushPendingTransactions; h.manager.host.tablePending = () => false;
+        });
+
+        // Equivalent native copies carry different view indexes and timestamps.
+        await page.evaluate(async () => {
+            await h.reset(h.block("body", "正文 [^A]") + h.block("a", "[^A]: 内容", "NodeParagraph", 'data-node-index="40" updated="20261017000000"'));
+            const side = h.manager.sidebar.protyle.wysiwyg.element;
+            const definition = side.querySelector('[data-node-id="a"]');
+            definition.dataset.nodeIndex = "1"; definition.setAttribute("updated", "20261017000001");
+            side.querySelector('[contenteditable="true"]').focus();
+        });
+        await page.locator('[data-action="normalize"]').click();
+        await page.waitForFunction(() => h.confirmations.length === 1);
+        await page.evaluate(() => {
+            h.mainElement.querySelector('[contenteditable="true"]').focus();
+            h.confirmations[0].callback();
+        });
+        await page.waitForFunction(() => h.transactions.length === 1);
+        assert.match(await page.evaluate(() => h.kernel.innerHTML), /data-type="NodeList"/);
+        assert.match(await page.evaluate(() => h.mainElement.innerHTML), /data-type="block-ref"/);
+
+        // A sidebar button can leave the document selection in an updated block.
+        await page.evaluate(async () => {
+            await h.reset(h.block("body", "正文 [^A] 后 [^B]")
+                + h.block("a", "[^A]: <b>A 内容</b>") + h.block("b", "[^B]: B 内容"));
+            h.command(2, 2);
+        });
+        await page.locator('[data-action="normalize"]').click();
+        await page.waitForFunction(() => h.confirmations.length === 1);
+        await page.evaluate(() => h.confirmations[0].callback());
+        await page.waitForFunction(() => h.transactions.length === 1);
+        assert.equal(await page.evaluate(() => h.mainElement.innerHTML), await page.evaluate(() => h.kernel.innerHTML));
+        assert.match(await page.evaluate(() => h.main.protyle.wysiwyg.lastHTMLs.body), /\[1\]/);
+        await page.evaluate(() => h.manager.refresh());
+        assert.match(await page.locator('[role="status"]').textContent(), /2 个脚注 · 2 处引用/);
+        await page.evaluate(() => h.replay(h.transactions[0].undo));
+        assert.match(await page.evaluate(() => h.mainElement.innerHTML), /\[\^A\]:/);
+        assert.equal(await page.locator('.main [data-type="NodeList"]').count(), 0);
+
+        // A synchronous submission failure restores the original nodes and caret.
+        await page.evaluate(async () => {
+            await h.reset(h.block("body", "正文 [^A]") + h.block("a", "[^A]: 内容"));
+            h.command(2, 2);
+            h.beforeNormalization = h.mainElement.innerHTML;
+            h.beforeCaret = getSelection().anchorNode;
+            await h.manager.normalize({format: "block", renumber: true, definitionFormat: "list"});
+            const submit = h.main.transaction;
+            h.main.transaction = () => {throw Error("整理提交失败");};
+            try {
+                h.confirmations[0].callback();
+                await new Promise(resolve => setTimeout(resolve, 0));
+            } finally {h.main.transaction = submit;}
+        });
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        assert.equal(await page.evaluate(() => h.mainElement.innerHTML), await page.evaluate(() => h.beforeNormalization));
+        assert.equal(await page.evaluate(() => getSelection().anchorNode === h.beforeCaret && getSelection().anchorOffset === 2), true);
+        assert.match(await page.evaluate(() => h.messages.at(-1)), /整理提交失败/);
 
         // Number-only anchors may target the item itself, not its paragraph.
         await page.evaluate(async () => {
@@ -244,6 +379,8 @@ function setupHost(modules) {
         assert.match(listResult, /data-type="NodeList"/);
         assert.doesNotMatch(listResult, /\[\^[^\]]+\]:/);
         assert.match(listResult, /<b>A 内容<\/b>/);
+        assert.equal(await page.evaluate(() => h.mainElement.innerHTML), listResult,
+            "The loaded editor must reflect deletes and insertion before the host submits normalization");
         await page.evaluate(async () => {
             for (const root of [h.kernel, h.mainElement]) {
                 const list = root.querySelector('[data-type="NodeList"]');
@@ -403,8 +540,11 @@ function setupHost(modules) {
             document.documentElement.style.setProperty("--b3-theme-surface", "#303744");
             document.documentElement.style.setProperty("--b3-theme-primary-lightest", "#303d64");
             document.documentElement.style.setProperty("--b3-theme-primary-light", "#657dc6");
+            document.documentElement.style.setProperty("--b3-theme-primary", "#91a7ff");
+            document.documentElement.style.setProperty("--b3-theme-on-primary", "#17213e");
+            document.documentElement.style.setProperty("--b3-border-color", "#424b5b");
         });
-        await page.screenshot({path: path.join(artifacts, "sidebar-mobile-dark.png")});
+        await page.screenshot({path: path.join(artifacts, "sidebar-mobile-dark.png"), animations: "disabled"});
         assert.equal(await page.evaluate(() => document.querySelector("#dock").scrollWidth > 390), false);
         await page.evaluate(() => {
             const panel = document.createElement("section");

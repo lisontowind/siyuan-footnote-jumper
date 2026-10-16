@@ -1,15 +1,20 @@
 import {confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Plugin, Protyle, showMessage} from "siyuan";
-import {applyInsertionToEditor, buildDocumentSnapshot, DocumentSnapshot, NormalizationOptions, prepareInsertion, prepareNormalization} from "./document";
+import {applyInsertionToEditor, applyNormalizationToEditor, buildDocumentSnapshot, documentContentSignature, DocumentSnapshot, NormalizationOptions, prepareInsertion, prepareNormalization} from "./document";
 import {FootnoteSidebar} from "./sidebar";
+import {flushDocumentEdits} from "./editing";
 
 const DOCK_TYPE = "footnotes";
 const escapeHTML = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const transactionSignature = (transaction: ReturnType<typeof prepareNormalization>) => JSON.stringify(transaction,
+    (key, value) => key === "data" && typeof value === "string" ? documentContentSignature(value) : value);
 
 interface ManagerHost {
     navigate(blockId: string): Promise<void>;
     tablePending(block: HTMLElement): boolean;
     changed(rootId: string): void;
+    jumpEnabled(): boolean;
+    setJumpEnabled(enabled: boolean): void;
 }
 
 export class FootnoteManager {
@@ -41,6 +46,8 @@ export class FootnoteManager {
                     normalize: (options) => void this.normalize(options),
                     refresh: () => this.schedule(0), ready: () => this.schedule(1000),
                     readonly: () => this.readonly(),
+                    jumpEnabled: () => this.host.jumpEnabled(),
+                    setJumpEnabled: (enabled) => this.host.setJumpEnabled(enabled),
                 });
                 this.observeVisibility();
                 this.updateVisibility();
@@ -72,6 +79,8 @@ export class FootnoteManager {
         document.addEventListener("transitionend", this.handleVisibilityTransition, true);
         this.captureMain();
     }
+
+    updateJumpStyle(enabled: boolean) {this.sidebar?.setJumpEnabled(enabled);}
 
     private readonly handleSwitch = (event: CustomEvent<{protyle: IProtyle}>) => {
         const protyle = event.detail.protyle;
@@ -106,6 +115,15 @@ export class FootnoteManager {
     private readonly handleKernel = (event: CustomEvent<{cmd: string; data?: unknown}>) => {
         if (["transactions", "refresh", "syncFinish"].indexOf(event.detail.cmd) < 0) return;
         if (event.detail.cmd === "transactions" && !this.affectsMain(event.detail.data)) return;
+        const transactions = (Array.isArray(event.detail.data) ? event.detail.data : [event.detail.data]) as
+            {doOperations?: IOperation[]}[];
+        // Undo/redo can replace an entire list or restore its former paragraphs.
+        // Discard the embedded copy before it can overlay the restored kernel DOM.
+        if (event.detail.cmd !== "transactions" || transactions.some((transaction) =>
+            Array.isArray(transaction?.doOperations)
+            && transaction.doOperations.some((operation) => ["insert", "delete", "move"].indexOf(operation?.action) >= 0))) {
+            this.sidebar?.invalidateEditor();
+        }
         this.revision++;
         this.schedule(1000);
     };
@@ -183,19 +201,12 @@ export class FootnoteManager {
         if (this.disposed || this.readonly()) throw new Error("当前文档为只读，无法修改脚注");
         if (this.main !== editor || !editor.protyle.wysiwyg?.element?.isConnected) throw new Error("当前文档已切换，请重新执行");
         if (this.composing) throw new Error("请结束输入法组合输入后重试");
-        for (const protyle of [editor.protyle, this.sidebar?.protyle]) {
-            for (const block of Array.from(protyle?.wysiwyg?.element?.querySelectorAll<HTMLElement>('[data-type="NodeTable"]') || [])) {
-                if (this.host.tablePending(block)) throw new Error("请先结束表格编辑并等待保存，再执行全文操作");
-            }
-        }
     }
 
     private async flush(editor: Protyle) {
-        // Newer hosts expose this publicly. Older supported hosts use the existing
-        // latest-DOM overlay plus the table/pending-block guard.
-        const flushable = editor as Protyle & {flushPendingTransactions?: () => Promise<void>};
-        await flushable.flushPendingTransactions?.();
         await this.sidebar?.flushPendingEdits();
+        await flushDocumentEdits([editor, this.sidebar?.protyle?.getInstance?.()],
+            () => this.assertWritable(editor), (block) => this.host.tablePending(block));
     }
 
     private async read(editor: Protyle) {
@@ -273,7 +284,7 @@ export class FootnoteManager {
             this.assertWritable(editor);
             if (editor.protyle.block.rootID !== rootId) throw new Error("当前文档已切换，请重新执行");
             if (revision !== this.revision) throw new Error("正文或脚注已改变，请重试");
-            const signature = snapshot.signature;
+            const signature = documentContentSignature(snapshot.container);
             if (snapshot.notes.some((note) => note.duplicate || note.missing)) {
                 this.open();
                 this.sidebar?.render(snapshot, editor.protyle.title?.editElement?.textContent || "当前文档");
@@ -303,18 +314,50 @@ export class FootnoteManager {
             this.assertWritable(editor);
             if (editor.protyle.block.rootID !== rootId) throw new Error("当前文档已切换，请重新执行");
             await this.flush(editor);
-            const revision = this.revision;
-            const snapshot = await this.read(editor);
-            this.assertWritable(editor);
-            if (editor.protyle.block.rootID !== rootId) throw new Error("当前文档已切换，请重新执行");
-            if (revision !== this.revision || snapshot.signature !== signature) throw new Error("正文或脚注已改变，请重新整理并确认");
+            let snapshot: DocumentSnapshot;
+            // A save notification may arrive after flush has resolved. Read again
+            // rather than treating that notification alone as a content change.
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const revision = this.revision;
+                snapshot = await this.read(editor);
+                this.assertWritable(editor);
+                if (editor.protyle.block.rootID !== rootId) throw new Error("当前文档已切换，请重新执行");
+                if (revision === this.revision) break;
+                if (attempt === 2) throw new Error("文档正在保存，请稍后重新整理");
+            }
+            if (documentContentSignature(snapshot.container) !== signature) throw new Error("正文或脚注已改变，请重新整理并确认");
             let index = 0;
             const transaction = prepareNormalization(snapshot, options, () => {
                 if (!allocated[index]) throw new Error("整理目标已改变，请重试");
                 return allocated[index++];
             });
-            if (JSON.stringify(transaction) !== JSON.stringify(reviewed)) throw new Error("整理目标已改变，请重试");
-            editor.transaction(transaction.forward, transaction.undo);
+            if (transactionSignature(transaction) !== transactionSignature(reviewed)) throw new Error("整理目标已改变，请重试");
+            const selection = window.getSelection();
+            const range = selection?.rangeCount ? selection.getRangeAt(0) : undefined;
+            const bookmark = range && {startContainer: range.startContainer, startOffset: range.startOffset,
+                endContainer: range.endContainer, endOffset: range.endOffset};
+            const local = applyNormalizationToEditor(editor.protyle.wysiwyg.element, transaction, rootId);
+            try {
+                editor.transaction(transaction.forward, transaction.undo);
+            } catch (error) {
+                local.rollback();
+                if (bookmark) {
+                    const restored = document.createRange();
+                    restored.setStart(bookmark.startContainer, bookmark.startOffset);
+                    restored.setEnd(bookmark.endContainer, bookmark.endOffset);
+                    selection.removeAllRanges(); selection.addRange(restored);
+                }
+                throw error;
+            }
+            // Keep the next native edit's undo baseline in sync with the new DOM.
+            const lastHTMLs = editor.protyle.wysiwyg.lastHTMLs;
+            if (lastHTMLs) {
+                for (const operation of transaction.forward) delete lastHTMLs[operation.id];
+                for (const block of Array.from(editor.protyle.wysiwyg.element.querySelectorAll<HTMLElement>("[data-node-id]"))) {
+                    if (block.closest('[data-type="NodeBlockQueryEmbed"]')) continue;
+                    lastHTMLs[block.dataset.nodeId] = block.outerHTML;
+                }
+            }
             this.previousLabels.delete(rootId);
             this.sidebar?.invalidateEditor();
             this.host.changed(snapshot.rootId);

@@ -14,7 +14,7 @@ function compile(name, imports, globals = {}) {
     vm.runInNewContext(source, {exports, require: (id) => {
         if (!(id in imports)) throw new Error(`Unexpected import: ${id}`);
         return imports[id];
-    }, console, ...globals}, {filename: name});
+    }, console, Error, ...globals}, {filename: name});
     return exports;
 }
 
@@ -61,7 +61,8 @@ function host() {
             return {code: 0, data: {dom}};
         }};
     const sidebarModule = compile("sidebar.ts", {siyuan: api, "./document": model}, {...globals, window: hostWindow});
-    const managerModule = compile("manager.ts", {siyuan: api, "./document": model, "./sidebar": sidebarModule}, {
+    const editing = compile("editing.ts", {siyuan: api, "./document": model}, {...globals, window: hostWindow});
+    const managerModule = compile("manager.ts", {siyuan: api, "./document": model, "./sidebar": sidebarModule, "./editing": editing}, {
         ...globals, window: hostWindow, CustomEvent: window.CustomEvent,
         MutationObserver: class {observe() {} disconnect() {}},
     });
@@ -81,9 +82,12 @@ function host() {
         return editor;
     };
     const opens = [], changes = [];
+    let jumpEnabled = true;
     const manager = new managerModule.FootnoteManager(plugin, {
+        jumpEnabled: () => jumpEnabled,
+        setJumpEnabled: (enabled) => {jumpEnabled = enabled; manager.updateJumpStyle(enabled);},
         navigate: async (id) => opens.push(id), tablePending: () => false, changed: (id) => changes.push(id)});
-    return {document, model, manager, plugin, api, hostWindow, nativeEditors, messages, confirmations,
+    return {document, model, manager, plugin, api, hostWindow, nativeEditors, messages, confirmations, editing,
         transactions, timers, addEditor, opens, changes, sidebarModule, editors,
         snapshot: (html, overlays = [], ignored) => model.buildDocumentSnapshot("doc", html, overlays, ignored),
         setDOM: (html) => {dom = html;}, setActive: (editor) => {active = editor;},
@@ -204,11 +208,11 @@ test("insert chooses unused number including missing refs and atomically adds te
     const tx = h.model.prepareInsertion(s, "body", 3, 6, "/脚注", () => `new-${++id}`);
     assert.equal(tx.label, "3");
     assert.equal(tx.forward.length, 3);
-    assert.equal(tx.forward[1].previousID, "d2");
-    assert.equal(tx.forward[2].previousID, tx.forward[1].id);
-    assert.equal(tx.forward[2].parentID, "doc");
-    assert.match(tx.forward[0].data, /data-id="new-1"/);
-    assert.match(tx.forward[2].data, /\[\^3\]: /);
+    assert.equal(tx.forward[0].previousID, "d2");
+    assert.equal(tx.forward[1].previousID, tx.forward[0].id);
+    assert.equal(tx.forward[1].parentID, "doc");
+    assert.match(tx.forward[2].data, /data-id="new-1"/);
+    assert.match(tx.forward[1].data, /\[\^3\]: /);
     assert.deepEqual(Array.from(tx.undo, op => op.action), ["delete", "delete", "update"]);
     assert.equal(tx.undo[2].data, h.snapshot(html).blocks[0].outerHTML);
 });
@@ -224,7 +228,7 @@ test("insertion reuses only a terminal top-level footnote section", () => {
     let id = 0;
     const next = h.model.prepareInsertion(h.snapshot(body + heading + note + anotherSection), "body", 0, 3, "/jz", () => `new-${++id}`);
     assert.equal(next.forward.length, 3);
-    assert.equal(next.forward[1].previousID, "end");
+    assert.equal(next.forward[0].previousID, "end");
 });
 
 test("pending new blocks and changed insertion text stop all writes", () => {
@@ -270,6 +274,30 @@ test("sidebar groups paragraphs, mounts original native block, retains editor an
     assert.equal(h.nativeEditors[1].destroyed, true);
     assert.equal(h.plugin.protyleSlash.length, 0);
     assert.equal(h.timers.size, 0);
+});
+
+test("sidebar jump style follows shared state and stays separate from normalization options", () => {
+    const h = host(); h.manager.register();
+    let panel = h.mount();
+    let toggle = panel.querySelector('[data-jump-style]');
+    const renumber = panel.querySelector('.siyuan-footnote-sidebar__check input');
+    assert.equal(toggle.checked, true);
+    const options = [];
+    h.manager.normalize = (value) => options.push(value);
+    panel.querySelector('select option[value="block"]').selected = true;
+    toggle.checked = false;
+    toggle.dispatchEvent(new h.document.defaultView.Event("change"));
+    h.manager.sidebar.clear();
+    assert.equal(toggle.checked, false);
+    panel.querySelector('[data-action="normalize"]').dispatchEvent(new h.document.defaultView.Event("click"));
+    assert.equal(options[0].renumber, renumber.checked);
+    assert.equal(options[0].format, "block");
+    h.manager.sidebar.destroy(); panel.remove();
+    panel = h.mount(); toggle = panel.querySelector('[data-jump-style]');
+    assert.equal(toggle.checked, false);
+    h.manager.updateJumpStyle(true);
+    assert.equal(toggle.checked, true);
+    assert.equal(h.transactions.length, 0);
 });
 
 test("sidebar focus never changes managed document and read-only mounts disable editing", async () => {
@@ -342,6 +370,53 @@ test("normalization confirmation rejects body edits and switched documents; unch
     assert.equal(clean.transactions[0].undo.length, clean.transactions[0].forward.length);
 });
 
+test("confirmation tolerates a focus change between equivalent main and sidebar editing copies", async () => {
+    const h = host();
+    const html = block("body", "正文 [^A]") + block("a", "[^A]: 内容", "NodeParagraph", 'data-node-index="40" updated="20261017000000"');
+    const editor = h.addEditor("doc", html); h.setDOM(html); h.manager.register(); h.mount();
+    await h.manager.refresh();
+    const side = h.manager.sidebar.protyle.wysiwyg.element;
+    side.innerHTML = block("a", "[^A]: 内容", "NodeParagraph", 'updated="20261017000001" data-node-index="1"');
+    let focused = side.querySelector('[contenteditable="true"]');
+    Object.defineProperty(h.document, "activeElement", {configurable: true, get: () => focused});
+    await h.manager.normalize({format: "block", renumber: true, definitionFormat: "list"});
+    assert.equal(h.confirmations.length, 1);
+    // Closing SiYuan's confirmation can restore focus to the main editor.
+    focused = editor.protyle.wysiwyg.element.querySelector('[contenteditable="true"]');
+    h.confirmations[0].cb(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.transactions.length, 1, h.messages.at(-1));
+    assert.match(h.transactions[0].forward.at(-1).data, /\[1\]/);
+});
+
+test("content comparison ignores renderer metadata but detects rich text, targets, properties and hierarchy changes", () => {
+    const h = host();
+    const original = block("body", `<b>正文</b> ${ref("a", "[^A]")} <a href="https://example.test/one">链接</a>`,
+        "NodeParagraph", 'updated="20261017000000" data-node-index="8" custom-color="red"') + block("a", "[^A]: 内容");
+    const signature = h.model.documentContentSignature(original);
+    const metadataOnly = original.replace('updated="20261017000000" data-node-index="8"', 'data-node-index="1" updated="20261017000001"')
+        .replace('contenteditable="true"', 'spellcheck="false" contenteditable="true"');
+    assert.equal(h.model.documentContentSignature(metadataOnly), signature);
+    for (const changed of [
+        original.replace("正文", "修改"), original.replace("<b>正文</b>", "<i>正文</i>"),
+        original.replace('data-id="a"', 'data-id="different"'), original.replace('custom-color="red"', 'custom-color="blue"'),
+        original.replace("example.test/one", "example.test/two"), original.replace("[^A]: 内容", "[^B]: 内容"),
+        block("a", "[^A]: 内容") + block("body", "正文 [^A]"),
+    ]) assert.notEqual(h.model.documentContentSignature(changed), signature);
+});
+
+test("late save notifications are reread during confirmation without rejecting unchanged content", async () => {
+    const h = host();
+    const html = block("body", "[^A]") + block("a", "[^A]: 内容");
+    h.addEditor("doc", html); h.setDOM(html); h.manager.register();
+    await h.manager.normalize({format: "block", renumber: true, definitionFormat: "list"});
+    const finish = h.deferRead();
+    h.confirmations[0].cb();
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    h.emit("ws-main", {cmd: "transactions", data: [{rootID: "doc", doOperations: [{action: "update", id: "body"}]}]});
+    finish(html); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.transactions.length, 1, h.messages.at(-1));
+});
+
 test("async preparation and stale sidebar reads cannot act on a switched document", async () => {
     const h = host();
     h.addEditor("doc", block("body", "[^A]"));
@@ -365,7 +440,10 @@ test("table pending, Chinese composition and async input block normalization", a
         h.addEditor("doc", block("body", "[^A]") + block("table", "<table></table>", "NodeTable"));
         h.setDOM(block("body", "[^A]") + block("a", "[^A]: note"));
         h.manager.register();
-        if (condition === "table") h.manager.host.tablePending = () => true;
+        if (condition === "table") {
+            h.manager.host.tablePending = () => true;
+            h.hostWindow.setTimeout = cb => setImmediate(cb);
+        }
         if (condition === "composition") h.manager.handleCompositionStart();
         let finish;
         if (condition === "input") finish = h.deferRead();
@@ -378,6 +456,80 @@ test("table pending, Chinese composition and async input block normalization", a
         await work;
         assert.equal(h.confirmations.length, 0, condition);
         assert.equal(h.transactions.length, 0, condition);
+    }
+});
+
+test("normalization ends table selection and waits for native save before preparing full table changes", async () => {
+    const h = host();
+    const table = text => block("table", `<table><tbody><tr><td>${text} [^A]</td></tr><tr><td>未加载行 [^A]</td></tr></tbody></table>`, "NodeTable");
+    const html = text => block("body", "正文 [^A]") + table(text) + block("a", "[^A]: note");
+    const editor = h.addEditor("doc", html("新内容"));
+    editor.protyle.wysiwyg.element.querySelectorAll('tr')[1].remove();
+    h.setDOM(html("旧内容")); h.manager.register();
+    h.manager.host.tablePending = () => true; // Active/display flags may remain set after save.
+    let ended = false, finish;
+    h.setSelection({anchorNode: editor.protyle.wysiwyg.element.querySelector('td').firstChild,
+        removeAllRanges() {ended = true; this.anchorNode = null;}});
+    editor.flushPendingTransactions = () => new Promise(resolve => {finish = () => {h.setDOM(html("新内容")); resolve();};});
+    const preparing = h.manager.normalize({format: "block", renumber: true});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ended, true);
+    assert.equal(h.confirmations.length, 0);
+    assert.equal(h.transactions.length, 0);
+    finish(); await preparing;
+    assert.equal(h.confirmations.length, 1, h.messages.at(-1));
+    editor.flushPendingTransactions = async () => {};
+    h.confirmations[0].cb(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.transactions.length, 1, h.messages.at(-1));
+    const savedTable = h.transactions[0].forward.find(op => op.id === "table").data;
+    assert.match(savedTable, /新内容/); assert.match(savedTable, /未加载行/);
+    assert.doesNotMatch(savedTable, /旧内容/);
+    assert.equal((savedTable.match(/data-type="block-ref"/g) || []).length, 2);
+});
+
+test("native save failures and document switches while saving stop normalization", async () => {
+    for (const failure of ["save", "switch"]) {
+        const h = host();
+        const html = block("body", "[^A]") + block("a", "[^A]: note");
+        const editor = h.addEditor("doc", html); h.setDOM(html); h.manager.register();
+        editor.flushPendingTransactions = async () => {
+            if (failure === "save") throw Error("native save rejected");
+            editor.protyle.block.rootID = "other";
+        };
+        await h.manager.normalize({format: "block", renumber: true});
+        assert.equal(h.confirmations.length, 0); assert.equal(h.transactions.length, 0);
+        assert.match(h.messages.at(-1), failure === "save" ? /保存编辑内容失败/ : /文档已切换/);
+    }
+});
+
+test("older hosts wait for matching rich table content instead of active flags", async () => {
+    const h = host();
+    const html = text => block("table", `<table><tbody><tr><td><b>${text}</b> [^A]</td></tr></tbody></table>`, "NodeTable");
+    const editor = h.addEditor("doc", html("新")); h.setDOM(html("旧"));
+    let waits = 0;
+    h.hostWindow.setTimeout = cb => {waits++; h.setDOM(html("新")); return setImmediate(cb);};
+    await h.editing.flushDocumentEdits([editor], () => {}, () => true);
+    assert.equal(waits, 1); assert.equal(h.transactions.length, 0);
+    const unchangedSelection = {anchorNode: h.document.createTextNode("outside"), removeAllRanges() {throw Error("paragraph selection cleared");}};
+    h.setSelection(unchangedSelection);
+    await h.editing.flushDocumentEdits([editor], () => {}, () => true);
+    assert.equal(h.hostWindow.getSelection(), unchangedSelection);
+});
+
+test("older hosts reject unsaved rich formatting and partial table copies without submitting them", async () => {
+    for (const mismatch of ["rich", "partial"]) {
+        const h = host();
+        const table = rows => block("table", `<table><tbody>${rows}</tbody></table>`, "NodeTable");
+        const live = table('<tr><td><b>same text</b></td></tr>');
+        const editor = h.addEditor("doc", live);
+        const original = editor.protyle.wysiwyg.element.innerHTML;
+        h.setDOM(mismatch === "rich" ? live.replace('<b>same text</b>', '<i>same text</i>')
+            : table('<tr><td><b>same text</b></td></tr><tr><td>unloaded</td></tr>'));
+        let waits = 0;
+        h.hostWindow.setTimeout = cb => {waits++; return setImmediate(cb);};
+        await assert.rejects(h.editing.flushDocumentEdits([editor], () => {}, () => true), /表格内容尚未保存完成/);
+        assert.equal(waits, 10); assert.equal(h.transactions.length, 0);
+        assert.equal(editor.protyle.wysiwyg.element.innerHTML, original);
     }
 });
 
@@ -426,8 +578,8 @@ test("slash insertion uses global Lute without a module export and leaves no wri
             const {forward, undo} = h.transactions[0];
             assert.equal(forward.length, 3);
             assert.equal(undo.length, 3);
-            assert.match(forward[0].data, /data-id="new-1"/);
-            assert.match(forward[2].data, /\[\^1\]: /);
+            assert.match(forward[2].data, /data-id="new-1"/);
+            assert.match(forward[1].data, /\[\^1\]: /);
             assert.match(editor.protyle.wysiwyg.lastHTMLs.body, /\[1\]/);
         } else {
             assert.equal(h.transactions.length, 0);
@@ -467,7 +619,7 @@ test("invalid local insertion data is rejected before modifying the editing copy
     const before = root.innerHTML;
     let id = 0;
     const tx = h.model.prepareInsertion(h.snapshot(html), "body", 0, 3, "/jz", () => `new-${++id}`);
-    tx.forward[2].data = block("wrong-id", "wrong definition");
+    tx.forward.find(operation => operation.id === tx.definitionId).data = block("wrong-id", "wrong definition");
     assert.throws(() => h.model.applyInsertionToEditor(root, tx, "body", tx.definitionId), /事务内容无效/);
     assert.equal(root.innerHTML, before);
 });
@@ -569,7 +721,7 @@ test("list-mode insertion appends a list item and local rollback restores both e
     let id = 0;
     const tx = h.model.prepareInsertion(h.snapshot(html), "body", 0, 3, "/jz", () => `new-${++id}`);
     assert.equal(tx.label, "4");
-    assert.deepEqual(Array.from(tx.forward, op => [op.action, op.id]), [["update", "body"], ["update", "tail"]]);
+    assert.deepEqual(Array.from(tx.forward, op => [op.action, op.id]), [["update", "tail"], ["update", "body"]]);
     const next = replay(h, h.snapshot(html).signature, tx.forward);
     assert.equal(h.snapshot(next).notes.length, 2);
     assert.doesNotMatch(next, /\[\^4\]:/);
@@ -578,6 +730,56 @@ test("list-mode insertion appends a list item and local rollback restores both e
     const local = h.model.applyInsertionToEditor(editor.protyle.wysiwyg.element, tx, "body", tx.definitionId);
     assert.equal(editor.protyle.wysiwyg.element.querySelectorAll('[data-type="NodeListItem"]').length, 2);
     local.rollback(); assert.equal(editor.protyle.wysiwyg.element.innerHTML, before);
+});
+
+test("normalization updates the loaded editor before submission and rolls back a rejected submission", async () => {
+    for (const fail of [false, true]) {
+        const h = host();
+        const html = block("body", "正文 [^B] [^A]") + block("a", "[^A]: <b>A</b>") + block("b", "[^B]: B");
+        const editor = h.addEditor("doc", html), root = editor.protyle.wysiwyg.element;
+        editor.protyle.wysiwyg.lastHTMLs = {body: root.firstElementChild.outerHTML};
+        const original = root.innerHTML, body = root.firstElementChild;
+        h.setDOM(html); h.manager.register();
+        const submit = editor.transaction;
+        editor.transaction = (forward, undo) => {
+            assert.equal(root.querySelectorAll('[data-type="NodeList"]').length, 1);
+            assert.equal(root.querySelectorAll('[data-type="NodeListItem"]').length, 2);
+            assert.doesNotMatch(root.textContent, /\[\^[AB]\]/);
+            assert.equal(root.querySelector('[data-type="block-ref"]').dataset.id, "b");
+            if (fail) throw Error("宿主事务提交失败");
+            submit(forward, undo);
+        };
+        await h.manager.normalize({format: "block", renumber: true, definitionFormat: "list"});
+        h.confirmations[0].cb(); await new Promise(resolve => setImmediate(resolve));
+        if (fail) {
+            assert.equal(root.innerHTML, original);
+            assert.equal(root.firstElementChild, body);
+            assert.equal(h.transactions.length, 0);
+            assert.match(h.messages.at(-1), /操作失败|宿主事务提交失败/);
+            assert.equal(editor.protyle.wysiwyg.lastHTMLs.body, body.outerHTML);
+        } else {
+            assert.equal(h.transactions.length, 1);
+            assert.equal(root.innerHTML, replay(h, original, h.transactions[0].forward));
+            assert.match(editor.protyle.wysiwyg.lastHTMLs.body, /\[1\]/);
+        }
+    }
+});
+
+test("normalization leaves unloaded insertion anchors alone and restores local deletes, updates and moves", () => {
+    const h = host();
+    const root = h.addEditor("doc", block("a", "A") + block("b", "B") + block("c", "C")).protyle.wysiwyg.element;
+    const original = root.innerHTML;
+    const local = h.model.applyNormalizationToEditor(root, {forward: [
+        {action: "delete", id: "b"}, {action: "update", id: "c", data: block("c", "new C")},
+        {action: "move", id: "a", previousID: "c", parentID: "doc"},
+        {action: "insert", id: "new", data: block("new", "new"), previousID: "unloaded", parentID: "doc"},
+    ]}, "doc");
+    assert.deepEqual(Array.from(root.children, node => node.dataset.nodeId), ["c", "a"]);
+    local.rollback(); assert.equal(root.innerHTML, original);
+    assert.throws(() => h.model.applyNormalizationToEditor(root, {forward: [
+        {action: "delete", id: "a"}, {action: "update", id: "c", data: block("wrong-id", "invalid")},
+    ]}, "doc"), /事务内容无效/);
+    assert.equal(root.innerHTML, original);
 });
 
 test("list conversion review reuses allocated IDs and rejects edits before committing", async () => {
@@ -590,6 +792,9 @@ test("list conversion review reuses allocated IDs and rejects edits before commi
     assert.equal(h.transactions.length, 1);
     const next = replay(h, h.snapshot(html).signature, h.transactions[0].forward);
     assert.equal(h.snapshot(next).notes[0].blockId, "a");
+    h.setDOM(next);
+    // The next review must have changes, then reject a concurrent edit.
+    options.definitionFormat = "literal";
     await h.manager.normalize(options);
     h.manager.main.protyle.wysiwyg.element.firstElementChild.querySelector('[contenteditable]').textContent = "changed [^A]";
     h.confirmations.at(-1).cb(); await new Promise(resolve => setImmediate(resolve));
@@ -681,6 +886,51 @@ test("definition layout preserves unrelated empty containers and removes only va
     assert.match(next, /data-node-id="empty"/);
     assert.doesNotMatch(next, /data-node-id="old-(list|item)"/);
     assert.equal(replay(h, next, tx.undo), h.snapshot(html).signature);
+});
+
+test("conversion and undo restore targets before writing native refs, including refs within definitions", () => {
+    const h = host();
+    const html = block("body", ref("a", "[^A]"))
+        + `<div data-node-id="quote" data-type="NodeBlockquote">${block("a", "[^A]: A")}${block("b", `[^B]: B ${ref("a", "see A")}`)}</div>`;
+    let id = 0;
+    const tx = h.model.prepareNormalization(h.snapshot(html), {format: "block", renumber: true, definitionFormat: "list"}, () => `new-${++id}`);
+    const after = replay(h, h.snapshot(html).signature, tx.forward);
+    assert.doesNotMatch(after, /data-node-id="quote"/);
+    assert.equal(tx.forward.at(-1).id, "b");
+    assert.ok(tx.forward.findIndex(op => op.action === "insert") < tx.forward.findIndex(op => op.id === "body"));
+    assert.ok(tx.undo.findIndex(op => op.action === "insert" && op.id === "quote") < tx.undo.findIndex(op => op.id === "body"));
+    assert.equal(replay(h, after, tx.undo), h.snapshot(html).signature);
+    const onlyDefinitions = h.snapshot(block("a", "[^A]: A") + block("b", "[^B]: B"));
+    const only = h.model.prepareNormalization(onlyDefinitions, {format: "block", renumber: true, definitionFormat: "list"}, () => `new-${++id}`);
+    assert.equal(only.undo.find(op => op.action === "insert").nextID, undefined);
+});
+
+test("empty native targets are recovered by unambiguous footnote labels without treating plain brackets as refs", () => {
+    const h = host();
+    const html = block("body", `${ref("", "[1]", "")} ${ref("", "[^2]", "")} [1] ${ref("unrelated", "[1]")}`)
+        + orderedList("tail", [["a", "A"], ["b", "B"]]);
+    const snapshot = h.snapshot(html);
+    assert.equal(snapshot.references.length, 2);
+    assert.equal(snapshot.notes.every(note => !note.missing), true);
+    const tx = h.model.prepareNormalization(snapshot, {format: "block", renumber: false, definitionFormat: "list"});
+    const fixed = h.snapshot(replay(h, h.snapshot(html).signature, tx.forward));
+    assert.deepEqual(Array.from(fixed.references, ref => ref.targetId), ["a", "b"]);
+});
+
+test("structural undo discards stale sidebar content before reading restored literal definitions", async () => {
+    const h = host(); h.manager.register(); h.mount();
+    const listed = block("body", ref("a", "[1]")) + orderedList("tail", [["a", "A"]]);
+    const editor = h.addEditor("doc", listed); h.setDOM(listed); await h.manager.refresh();
+    const embedded = h.nativeEditors.at(-1);
+    embedded.protyle.wysiwyg.element.innerHTML = block("a", "A");
+    const restored = block("body", ref("a", "[^A]")) + block("a", "[^A]: A");
+    editor.protyle.wysiwyg.element.innerHTML = restored; h.setDOM(restored);
+    h.emit("ws-main", {cmd: "transactions", data: [{doOperations: [{action: "delete", id: "tail"}, {action: "insert", id: "a"}]}]});
+    assert.equal(embedded.destroyed, true);
+    const snapshot = await h.manager.read(editor);
+    assert.equal(snapshot.definitionFormat, "literal");
+    assert.equal(snapshot.notes[0].label, "A");
+    assert.equal(snapshot.references.length, 1);
 });
 
 test("sidebar ignores other-root events but refreshes mixed, unscoped and sync transactions", () => {

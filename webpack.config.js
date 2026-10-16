@@ -16,7 +16,8 @@ module.exports = (env, argv) => {
 
     if (production) {
         plugins.push(new webpack.BannerPlugin({
-            banner: () => fs.existsSync("LICENSE") ? fs.readFileSync("LICENSE").toString() : "",
+            banner: () => `Footnote Jumper v${require("./plugin.json").version}\n`
+                + (fs.existsSync("LICENSE") ? fs.readFileSync("LICENSE").toString() : ""),
         }));
         plugins.push(new CopyPlugin({
             patterns: [
