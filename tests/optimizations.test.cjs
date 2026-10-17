@@ -62,11 +62,11 @@ function host() {
     const model = compile("document.ts", {"./definitions": definitions, "./inline": compile("inline.ts", {})}, {document});
     const editing = compile("editing.ts", {siyuan: api, "./document": model}, {document, window: hostWindow});
     const Plugin = compile("index.ts", {siyuan: api, "./definitions": definitions, "./inline": compile("inline.ts", {}), "./editing": editing,
-        "./manager": {FootnoteManager: class {}}, "./index.scss": {}}, {
+        "./document": model, "./manager": {FootnoteManager: class {}}, "./index.scss": {}}, {
         document, window: hostWindow, Date: HostDate, Node: window.Node, HTMLElement: window.HTMLElement,
         NodeFilter: {SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2},
     }).default;
-    const plugin = new Plugin();
+    const plugin = new Plugin(); plugin.preferences.format = "text"; plugin.enabled = true;
     plugin.positionTooltip = () => {};
     const addEditor = (rootID, html = "") => {
         const element = document.createElement("div");
@@ -432,8 +432,8 @@ test("split rich markers each become one live reference and retain formatting af
     assert.equal(body.querySelectorAll(".siyuan-footnote-ref").length, 3);
     assert.equal(h.plugin.convertFootnoteMarkersToNativeRefs(body, h.plugin.collectDefinitions(editor)), 3);
     assert.deepEqual(Array.from(body.querySelectorAll('[data-type="block-ref"]'), r => [r.dataset.id, r.textContent]),
-        [["d", "[1]"], ["d", "[1]"], ["d", "[1]"]]);
-    assert.equal(body.textContent, before.replace(/\[\^1\]/g, "[1]"));
+        [["d", "[^1]"], ["d", "[^1]"], ["d", "[^1]"]]);
+    assert.equal(body.textContent, before);
 });
 
 test("live parsing does not join markers across code, cells, line breaks or native refs", () => {
@@ -450,4 +450,64 @@ test("live parsing does not join markers across code, cells, line breaks or nati
     h.plugin.wrapReferences(table, definitions);
     assert.equal(table.querySelectorAll(".siyuan-footnote-ref").length, 1);
     assert.equal(h.plugin.convertFootnoteMarkersToNativeRefs(table, definitions), 1);
+});
+
+test("native superscript markers retain navigation without receiving another superscript enhancement", () => {
+    const h = host();
+    const editor = h.addEditor("doc", block("body", '<span data-type="sup strong">[^1]</span> '
+        + '<sup>[^<b>1</b>]</sup> <span style="vertical-align: super">[^1]</span> 普通 [^1] '
+        + '<span data-type="block-ref sup" data-subtype="s" data-id="d">[^1]</span> '
+        + '<sup><span data-type="block-ref" data-subtype="s" data-id="d">[1]</span></sup> '
+        + '<span data-type="block-ref" data-subtype="s" data-id="d">[^1]</span>') + block("d", "[^1]: 内容"));
+    const body = editor.querySelector('[data-node-id="body"]');
+    const definitions = h.plugin.collectDefinitions(editor);
+    h.plugin.wrapReferences(body, definitions);
+    h.plugin.styleNativeFootnotes(body, definitions);
+    const text = Array.from(body.querySelectorAll('.siyuan-footnote-ref'));
+    assert.equal(text.length, 4);
+    assert.deepEqual(text.map(r => r.classList.contains('siyuan-footnote-ref--native-sup')), [true, true, true, false]);
+    assert.ok(text.every(r => r.dataset.footnoteId === "1" && r.dataset.preview === "内容"));
+    const native = Array.from(body.querySelectorAll('[data-type~="block-ref"]'));
+    assert.deepEqual(native.map(r => r.classList.contains('siyuan-footnote-native-ref')), [false, false, true]);
+    h.plugin.cleanupEnhancements();
+    assert.equal(body.querySelector('.siyuan-footnote-ref'), null);
+    assert.equal(body.querySelector('[data-type="sup strong"]').textContent, "[^1]");
+    assert.equal(native[0].dataset.type, "block-ref sup");
+});
+
+
+test("settings migrate old toggles, validate stored preferences, and restore mode-specific values", async () => {
+    const h = host(), plugin = new h.plugin.constructor();
+    plugin.loadData = async () => ({enabled: false, liveRefreshEditingBlock: false});
+    await plugin.loadSettings();
+    assert.equal(plugin.preferences.format, 'block'); assert.equal(plugin.enabled, false);
+    assert.equal(plugin.jumpStyleEnabled, false); assert.equal(plugin.liveRefreshEditingBlock, false);
+    plugin.loadData = async () => ({enabled: true, liveRefreshEditingBlock: true,
+        preferences: {format: 'text', definitionFormat: 'literal', blockLabel: 'brackets', renumber: false, superscript: false}});
+    await plugin.loadSettings(); assert.equal(plugin.enabled, true);
+    const saved = []; plugin.saveData = async (name, value) => saved.push(value);
+    plugin.setPreferences({...plugin.preferences, format: 'block'});
+    assert.equal(plugin.enabled, false); assert.equal(plugin.jumpStyleEnabled, true);
+    plugin.setPreferences({...plugin.preferences, format: 'text'});
+    assert.equal(plugin.enabled, true); assert.equal(saved.at(-1).preferences.blockLabel, 'brackets');
+    plugin.loadData = async () => ({preferences: {format: 'invalid', definitionFormat: 'bad', superscript: 'yes'}});
+    await plugin.loadSettings(); assert.equal(plugin.preferences.format, 'text'); assert.equal(plugin.preferences.superscript, false);
+});
+
+test("manual refresh processes an active block with live refresh off and defers Chinese composition", async () => {
+    const h = host(), html = block('body', '正文 [^1]') + block('d', '[^1]: 内容');
+    const root = h.addEditor('doc', html); h.setDOM(html);
+    const body = root.firstElementChild;
+    h.plugin.liveRefreshEditingBlock = false; h.plugin.activeBlock = body; h.plugin.activeBlockId = 'body';
+    h.plugin.markAllBlocksDirty(); h.plugin.refresh();
+    assert.equal(body.querySelector('.siyuan-footnote-ref'), null);
+    h.plugin.isComposing = true; await h.plugin.manualRefresh();
+    assert.equal(h.plugin.manualRefreshPending, true); assert.equal(body.querySelector('.siyuan-footnote-ref'), null);
+    h.plugin.handleCompositionEnd();
+    for (let tick = 0; tick < 20; tick++) await Promise.resolve();
+    assert.ok(body.querySelector('.siyuan-footnote-ref')); assert.equal(h.plugin.manualRefreshPending, false);
+    const saved = []; h.plugin.saveData = async (name, value) => saved.push(value);
+    h.plugin.setPreferences({...h.plugin.preferences, format: 'block'});
+    assert.equal(body.querySelector('.siyuan-footnote-ref'), null);
+    assert.equal(body.textContent, '正文 [^1]'); assert.equal(h.transactions.length, 0);
 });

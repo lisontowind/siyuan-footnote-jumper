@@ -98,15 +98,16 @@ function canonical(dom) {
             const replayed = await read(id);
             assert.deepEqual(canonical(replayed), canonical(after), "native redo restores the conversion");
             await assertTargets(replayed);
+            return after;
         };
-        const insertionCycle = async (id, body) => {
+        const insertionCycle = async (id, body, options) => {
             const root = document.createElement("div"); root.innerHTML = await read(id);
             const source = root.querySelector(`[data-node-id="${body}"]`);
             const editable = source.querySelector('[contenteditable="true"]');
             editable.append(document.createTextNode(" /jz"));
             const end = editable.textContent.length;
             await submit([{action: "update", id: body, data: source.outerHTML}]);
-            await cycle(id, undefined, snapshot => model.prepareInsertion(snapshot, body, end - 3, end, "/jz", nodeID));
+            await cycle(id, undefined, snapshot => model.prepareInsertion(snapshot, body, end - 3, end, "/jz", nodeID, options));
         };
         for (const layout of ["plain", "nested", "definitions-only", "definition-first"]) {
             const id = await api("filetree/createDocWithMd", {notebook, path: "/" + layout, markdown: "测试"});
@@ -147,6 +148,55 @@ function canonical(dom) {
             console.log(`Kernel conversion/undo/redo passed: ${layout}`);
         }
         console.log("Kernel insertion/undo/redo passed: literal and list");
+        for (const format of ["block", "text"]) {
+            const id = await api("filetree/createDocWithMd", {notebook, path: `/picker-${format}`, markdown: "正文 /jz"});
+            const snapshot = model.buildDocumentSnapshot(id, await read(id)), body = snapshot.blocks[0].dataset.nodeId;
+            const preferences = {...model.DEFAULT_PREFERENCES, format};
+            const content = '<b>普通文本</b> & 说明\n第二行';
+            await cycle(id, undefined, current => model.prepareInsertion(current, body, 3, 6, "/jz", nodeID, {preferences, content}));
+            let current = model.buildDocumentSnapshot(id, await read(id));
+            assert.equal(current.definitionFormat, format === "block" ? "list" : "literal");
+            assert.equal(current.notes.length, 1); assert.equal(current.references[0].kind, format);
+            assert.equal(current.notes[0].content, content);
+            const existingId = current.notes[0].blockId;
+            await insertionCycle(id, body, {preferences, existingId, content: '复用时不能覆盖'});
+            current = model.buildDocumentSnapshot(id, await read(id));
+            assert.equal(current.notes.length, 1); assert.equal(current.references.length, 2);
+            assert.equal(current.notes[0].content, content);
+            await insertionCycle(id, body, {preferences, content: '新追加的说明'});
+            const appended = model.buildDocumentSnapshot(id, await read(id));
+            assert.equal(appended.notes.length, 2);
+            assert.equal(appended.notes[1].content, '新追加的说明');
+            console.log(`Kernel picker creation/reuse/append/undo/redo passed: ${format}`);
+        }
+        for (const format of ["block", "text", "keep"]) for (const blockLabel of ["caret", "brackets"]) {
+            const id = await api("filetree/createDocWithMd", {notebook, path: `/styles-${format}-${blockLabel}`, markdown: "测试"});
+            const body = nodeID(), definition = nodeID();
+            const old = document.createElement("div"); old.innerHTML = await read(id);
+            const styled = paragraph(body, '<span data-type="strong text" style="color: red">前 [^12] 后</span> '
+                + `<span data-type="block-ref em" data-subtype="s" data-id="${definition}">[12]</span>`);
+            await submit([...Array.from(old.children, element => ({action: "delete", id: element.dataset.nodeId})),
+                {action: "insert", id: definition, parentID: id, data: paragraph(definition, "[^12]: 内容")},
+                {action: "insert", id: body, parentID: id, nextID: definition, data: styled}]);
+            const options = {format, blockLabel, renumber: true, superscript: true, definitionFormat: "list"};
+            const after = await cycle(id, options);
+            const snapshot = model.buildDocumentSnapshot(id, after);
+            assert.equal(snapshot.definitionFormat, format === "block" ? "list" : "literal");
+            assert.equal(snapshot.references.length, 2);
+            assert.equal(snapshot.notes.some(note => note.missing), false);
+            const source = snapshot.blocks.find(block => block.dataset.nodeId === body);
+            const markers = Array.from(source.querySelectorAll('[data-type~="sup"]'));
+            assert.equal(markers.length, 2);
+            assert.equal(markers[0].matches('[data-type~="strong"]'), true);
+            assert.equal(markers[0].style.color, "red");
+            assert.equal(markers[1].matches('[data-type~="em"]'), true);
+            assert.equal(snapshot.references.filter(r => r.kind === "block").length, format === "block" ? 2 : format === "keep" ? 1 : 0);
+            for (const marker of markers) assert.equal(marker.textContent,
+                marker.matches('[data-type~="block-ref"]') && blockLabel === "brackets" ? "[1]" : "[^1]");
+            await cycle(id, {format: format === "text" ? "block" : "text", renumber: false,
+                definitionFormat: format === "text" ? "list" : "literal"});
+            console.log(`Kernel native styles/targets/undo/redo passed: ${format}, ${blockLabel}`);
+        }
     } catch (error) {
         fs.writeFileSync(path.join(dir, "kernel.log"), logs); throw error;
     } finally {kernel.kill();}

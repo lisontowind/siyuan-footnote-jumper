@@ -110,7 +110,14 @@ function setupHost(modules) {
     }
     // Match the real plugin runtime: Lute is global, not a siyuan module export.
     window.Lute = {NewNodeID: () => `new-${++id}`};
-    h.api = {Protyle, Plugin: class {constructor() {this.name = "test"; this.app = {};}}, getActiveEditor: () => h.active,
+    h.api = {Protyle,
+        Dialog: class {
+            constructor(options) {this.options = options; this.element = document.createElement("div");
+                this.element.setAttribute("role", "dialog"); this.element.innerHTML = options.content;
+                this.element.style.cssText = `position:fixed;z-index:20;top:10%;left:50%;transform:translateX(-50%);width:min(${options.width},95vw);background:white;border:1px solid #ccc;box-shadow:0 10px 50px #0003`;
+                document.body.append(this.element); this.element.tabIndex = -1; this.element.focus();}
+            destroy() {this.element.remove(); this.options.destroyCallback?.();}
+        }, Plugin: class {constructor() {this.name = "test"; this.app = {};}}, getActiveEditor: () => h.active,
         getAllEditor: () => h.editors.filter(editor => !editor.destroyed), getFrontend: () => h.frontend,
         showMessage: text => h.messages.push(text), confirm: (title, text, callback) => h.confirmations.push({title, text, callback}),
         fetchSyncPost: async url => {
@@ -135,7 +142,13 @@ function setupHost(modules) {
         off(name, cb) {h.listeners.get(name)?.delete(cb);}},
         addDock(options) {h.dock = options; options.init({element: document.querySelector("#dock")});}};
     h.manager = new (load("./manager").FootnoteManager)(h.plugin, {
-        jumpEnabled: () => h.jumper.enabled,
+        jumpEnabled: () => h.jumper.jumpStyleEnabled,
+        preferences: () => h.jumper.preferences,
+        setPreferences: preferences => h.jumper.setPreferences(preferences),
+        liveRefresh: () => h.jumper.liveRefreshEditingBlock,
+        setLiveRefresh: enabled => h.jumper.setLiveRefreshEditingBlock(enabled),
+        manualRefresh: editor => h.jumper.manualRefresh(editor.protyle),
+        checkDuplicates: anchor => h.jumper.checkDuplicateDefinitions(anchor),
         setJumpEnabled: enabled => h.jumper.setEnabled(enabled),
         navigate: async id => h.opened.push(id), tablePending: () => false, changed: () => {}});
     h.jumper = new (load("./index").default)();
@@ -144,6 +157,8 @@ function setupHost(modules) {
     h.jumper.saveData = async (name, value) => {h.savedSettings.push({...value});};
     h.mainElement.addEventListener("focusin", () => {h.active = h.main;});
     h.reset = async (html, loaded = html) => {
+        h.manager.sidebar.showPanel("notes");
+        h.manager.insertionDialog?.destroy();
         id = 0;
         h.manager.sidebar?.invalidateEditor();
         h.manager.previousLabels.clear();
@@ -151,6 +166,13 @@ function setupHost(modules) {
         h.active = h.main; h.transactions = []; h.confirmations = []; h.messages = [];
         h.manager.main = h.main; h.manager.pendingSelection = undefined;
         await h.manager.refresh();
+    };
+    h.chooseNew = async () => {
+        h.manager.insertionDialog?.element.querySelector('[data-picker-create]').click();
+        const button = h.manager.insertionDialog?.element.querySelector('[data-picker-submit]');
+        if (!button || button.disabled) throw Error("Picker was not ready");
+        button.click();
+        while (h.manager.busy) await new Promise(resolve => setTimeout(resolve, 0));
     };
     h.command = (start, end) => {
         const editable = h.mainElement.querySelector('[contenteditable="true"]');
@@ -167,6 +189,15 @@ function setupHost(modules) {
     const browser = await chromium.launch({headless: true, executablePath: process.env.FOOTNOTE_BROWSER_EXECUTABLE});
     try {
         const page = await browser.newPage({viewport: {width: 1100, height: 850}});
+        const originalEvaluate = page.evaluate.bind(page);
+        let evaluateStep = 0;
+        page.evaluate = async (expression, arg) => {
+            const step = ++evaluateStep;
+            let timeout;
+            try {return await Promise.race([originalEvaluate(expression, arg), new Promise((_, reject) => {
+                timeout = setTimeout(() => reject(Error(`Browser evaluation ${step} timed out: ${String(expression).slice(0, 180)}`)), 15000);
+            })]);} finally {clearTimeout(timeout);}
+        };
         const errors = [];
         page.on("pageerror", error => errors.push(error.message));
         await page.setContent(`<html lang="zh-CN"><style>
@@ -175,6 +206,22 @@ function setupHost(modules) {
         </style><main class="main protyle-wysiwyg"></main><aside id="dock"></aside></html>`);
         await page.addStyleTag({content: fs.readFileSync(path.join(workspace, "dist", "index.css"), "utf8")});
         await page.evaluate(setupHost, modules);
+        assert.equal(await page.locator('[data-superscript]').isChecked(), true);
+        const assertMatchingCards = async () => {
+            assert.equal(await page.evaluate(() => {
+                const mode = getComputedStyle(document.querySelector('.siyuan-footnote-sidebar__mode'));
+                const tools = getComputedStyle(document.querySelector('.siyuan-footnote-sidebar__tools'));
+                return ['backgroundColor', 'borderTopColor', 'borderTopWidth', 'borderRadius', 'paddingTop', 'paddingLeft', 'marginLeft', 'marginRight']
+                    .every(property => mode[property] === tools[property])
+                    && ['fontSize', 'fontWeight', 'color', 'lineHeight'].every(property =>
+                        getComputedStyle(document.querySelector('.siyuan-footnote-sidebar__mode .siyuan-footnote-sidebar__section-title'))[property]
+                        === getComputedStyle(document.querySelector('.siyuan-footnote-sidebar__tools .siyuan-footnote-sidebar__section-title'))[property]);
+            }), true, 'Reference mode and formatting cards must share their visual styling');
+        };
+        await assertMatchingCards();
+        assert.equal(await page.locator('[data-jump-style]').isVisible(), false);
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole('combobox', {name: '目标脚注写法'}).selectOption('text');
 
         // Both controls share persisted state. Disabling restores text and
         // native ref styles while preserving native targets and anchors.
@@ -185,12 +232,13 @@ function setupHost(modules) {
             h.jumper.markAllBlocksDirty(); h.jumper.refresh();
             if (!h.mainElement.querySelector('.siyuan-footnote-ref')) throw Error("Text marker not enhanced");
         });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.getByRole("switch", {name: "脚注跳转样式"}).uncheck();
         await page.evaluate(async () => {
             h.jumper.refresh();
             if (h.jumper.enabled || h.savedSettings.at(-1).enabled) throw Error("Panel did not persist disabled state");
             if (h.mainElement.querySelector('.siyuan-footnote-ref')) throw Error("Text marker still enhanced");
-            const anchor = h.mainElement.querySelector('[data-type="block-ref"]');
+            const anchor = h.mainElement.querySelector('[data-type~="block-ref"]');
             if (anchor.dataset.id !== "d" || anchor.dataset.subtype !== "s" || anchor.textContent !== "[1]") throw Error("Static target or anchor changed");
             if (anchor.classList.contains('siyuan-footnote-native-ref')) throw Error("Native ref style was not restored");
             const style = getComputedStyle(anchor);
@@ -213,6 +261,8 @@ function setupHost(modules) {
             h.nativeEditors.length = 0;
         });
 
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole('combobox', {name: '目标脚注写法'}).selectOption('block');
         // Exercise transient rich markers and caret restoration in a real DOM.
         await page.evaluate(() => {
             h.mainElement.innerHTML = h.block("rich", '前 <b>字 [^1</b><i>]</i> 中 [<b>^1</b>] 后 [^1]') + h.block("d", "[^1]: 内容");
@@ -234,8 +284,8 @@ function setupHost(modules) {
             h.jumper.cleanupBlock(block);
             if (styled() !== formatting || block.textContent !== text) throw Error("Cleanup lost rich marker formatting");
             if (h.jumper.convertFootnoteMarkersToNativeRefs(block, definitions) !== 3) throw Error("Split markers were not converted");
-            if (Array.from(block.querySelectorAll('[data-type="block-ref"]')).some(ref => ref.textContent !== "[1]")) {
-                throw Error("Static refs must use plain brackets");
+            if (Array.from(block.querySelectorAll('[data-type~="block-ref"]')).some(ref => ref.textContent !== "[^1]")) {
+                throw Error("Static refs must use caret brackets by default");
             }
         });
 
@@ -244,15 +294,23 @@ function setupHost(modules) {
                 + h.block("a", '[^A]: <b>保留加粗</b>和<a href="https://example.test">链接</a>。')
                 + h.block("b", "[^B]: 第二个定义。") + h.block("unused", "[^unused]: 未引用的说明。"));
         });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        assert.equal(await page.getByRole('textbox', {name: '脚注编号', exact: true}).isVisible(), false);
+        await assertMatchingCards();
+        await page.screenshot({path: path.join(artifacts, "settings-desktop.png"), animations: "disabled"});
+        await page.getByRole("tab", {name: "设置", exact: true}).press('ArrowLeft');
+        assert.equal(await page.getByRole("tab", {name: "脚注", exact: true}).getAttribute('aria-selected'), 'true');
         await page.waitForFunction(() => h.nativeEditors.length === 1);
         const layout = await page.evaluate(() => ({width: document.querySelector("#dock").getBoundingClientRect().width,
             overflow: document.querySelector("#dock").scrollWidth > document.querySelector("#dock").clientWidth}));
         assert.equal(layout.width, 360); assert.equal(layout.overflow, false);
         await page.screenshot({path: path.join(artifacts, "sidebar-desktop.png"), animations: "disabled"});
         const nativeCount = await page.evaluate(() => h.nativeEditors.length);
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
         await page.locator('[data-note-key="b"]').click();
         await page.evaluate(() => h.manager.refresh());
         assert.equal(await page.evaluate(() => h.nativeEditors.length), nativeCount);
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
         await page.locator('[data-block-id="body"]').click();
         assert.equal(await page.evaluate(() => h.opened[0]), "body");
 
@@ -287,7 +345,7 @@ function setupHost(modules) {
         await page.evaluate(() => {
             const table = h.kernel.querySelector('[data-node-id="table"]');
             if (!table.textContent.includes("新内容") || !table.textContent.includes("未加载行")
-                || table.querySelectorAll('[data-type="block-ref"]').length !== 2) throw Error("Table save or unloaded rows lost");
+                || table.querySelectorAll('[data-type~="block-ref"]').length !== 2) throw Error("Table save or unloaded rows lost");
             delete h.main.flushPendingTransactions; h.manager.host.tablePending = () => false;
         });
 
@@ -299,6 +357,7 @@ function setupHost(modules) {
             definition.dataset.nodeIndex = "1"; definition.setAttribute("updated", "20261017000001");
             side.querySelector('[contenteditable="true"]').focus();
         });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.locator('[data-action="normalize"]').click();
         await page.waitForFunction(() => h.confirmations.length === 1);
         await page.evaluate(() => {
@@ -307,7 +366,7 @@ function setupHost(modules) {
         });
         await page.waitForFunction(() => h.transactions.length === 1);
         assert.match(await page.evaluate(() => h.kernel.innerHTML), /data-type="NodeList"/);
-        assert.match(await page.evaluate(() => h.mainElement.innerHTML), /data-type="block-ref"/);
+        assert.match(await page.evaluate(() => h.mainElement.innerHTML), /data-type="block-ref sup"/);
 
         // A sidebar button can leave the document selection in an updated block.
         await page.evaluate(async () => {
@@ -315,14 +374,15 @@ function setupHost(modules) {
                 + h.block("a", "[^A]: <b>A 内容</b>") + h.block("b", "[^B]: B 内容"));
             h.command(2, 2);
         });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.locator('[data-action="normalize"]').click();
         await page.waitForFunction(() => h.confirmations.length === 1);
         await page.evaluate(() => h.confirmations[0].callback());
         await page.waitForFunction(() => h.transactions.length === 1);
         assert.equal(await page.evaluate(() => h.mainElement.innerHTML), await page.evaluate(() => h.kernel.innerHTML));
-        assert.match(await page.evaluate(() => h.main.protyle.wysiwyg.lastHTMLs.body), /\[1\]/);
+        assert.match(await page.evaluate(() => h.main.protyle.wysiwyg.lastHTMLs.body), /\[\^1\]/);
         await page.evaluate(() => h.manager.refresh());
-        assert.match(await page.locator('[role="status"]').textContent(), /2 个脚注 · 2 处引用/);
+        assert.match(await page.locator('.siyuan-footnote-sidebar__status').textContent(), /2 个脚注 · 2 处引用/);
         await page.evaluate(() => h.replay(h.transactions[0].undo));
         assert.match(await page.evaluate(() => h.mainElement.innerHTML), /\[\^A\]:/);
         assert.equal(await page.locator('.main [data-type="NodeList"]').count(), 0);
@@ -359,10 +419,10 @@ function setupHost(modules) {
         await page.evaluate(() => h.manager.normalize({format: "keep", renumber: true, definitionFormat: "literal"}));
         await page.evaluate(() => h.confirmations[0].callback());
         await page.waitForFunction(() => h.transactions.length === 1);
-        assert.deepEqual(await page.evaluate(() => Array.from(h.kernel.querySelectorAll('[data-type="block-ref"]'),
-            node => [node.dataset.id, node.textContent])), [["b", "[1]"], ["a", "[2]"]]);
+        assert.deepEqual(await page.evaluate(() => Array.from(h.kernel.querySelectorAll('[data-type~="block-ref"]'),
+            node => [node.dataset.id, node.textContent])), [["b", "[^1]"], ["a", "[^2]"]]);
         await page.evaluate(() => h.replay(h.transactions[0].undo));
-        assert.deepEqual(await page.evaluate(() => Array.from(h.kernel.querySelectorAll('[data-type="block-ref"]'),
+        assert.deepEqual(await page.evaluate(() => Array.from(h.kernel.querySelectorAll('[data-type~="block-ref"]'),
             node => [node.dataset.id, node.textContent])), [["li-b", "[2]"], ["a", "[1]"]]);
 
         // Both definition formats and the explicit number-refresh flow.
@@ -370,7 +430,9 @@ function setupHost(modules) {
             await h.reset(h.block("body", "正文 [^A] 后 [^B]")
                 + h.block("a", "[^A]: <b>A 内容</b>") + h.block("b", "[^B]: B 内容"));
         });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.locator('[data-definition-format]').selectOption("list");
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.locator('[data-action="normalize"]').click();
         await page.waitForFunction(() => h.confirmations.length === 1);
         await page.evaluate(() => h.confirmations[0].callback());
@@ -392,17 +454,20 @@ function setupHost(modules) {
             }
             await h.manager.refresh();
         });
-        await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("序号已变化"));
+        await page.waitForFunction(() => document.querySelector('.siyuan-footnote-sidebar__status').textContent.includes("序号已变化"));
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.locator('[data-action="refresh-numbers"]').click();
         await page.waitForFunction(() => h.confirmations.length === 2);
         await page.evaluate(() => h.confirmations[1].callback());
         await page.waitForFunction(() => h.transactions.length === 2);
-        assert.deepEqual(await page.evaluate(() => Array.from(h.kernel.querySelectorAll('[data-type="block-ref"]'),
-            node => [node.dataset.id, node.textContent])), [["a", "[2]"], ["b", "[1]"]]);
+        assert.deepEqual(await page.evaluate(() => Array.from(h.kernel.querySelectorAll('[data-type~="block-ref"]'),
+            node => [node.dataset.id, node.textContent])), [["a", "[^2]"], ["b", "[^1]"]]);
         await page.evaluate(() => h.manager.refresh());
         assert.equal(await page.locator('[data-action="refresh-numbers"]').isVisible(), false);
         await page.screenshot({path: path.join(artifacts, "ordered-footnotes.png")});
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.locator('[data-definition-format]').selectOption("literal");
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.locator('[data-action="normalize"]').click();
         await page.waitForFunction(() => h.confirmations.length === 3);
         await page.evaluate(() => h.confirmations[2].callback());
@@ -410,25 +475,132 @@ function setupHost(modules) {
         assert.equal(await page.evaluate(() => h.kernel.querySelector('[data-type="NodeList"]')), null);
         assert.match(await page.evaluate(() => h.kernel.innerHTML), /\[\^1\]: <b>A 内容<\/b>/);
 
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole('combobox', {name: '目标脚注写法'}).selectOption('block');
+        // The insertion picker searches every note while rendering adjacent batches.
+        await page.evaluate(async () => {
+            const notes = Array.from({length: 1000}, (_, i) => h.block(`picker-large-${i + 1}`, `[^${i + 1}]: 动态候选 ${i + 1}`));
+            await h.reset(h.block('body', '正文 /jz 末尾') + notes.join(''));
+            h.command(3, 6); await h.manager.insert(h.main, h.mainElement.firstElementChild);
+            h.firstPickerRow = document.querySelector('[data-definition-id="picker-large-1"]');
+        });
+        const largePickerList = page.locator('[data-picker-notes]');
+        const largePickerSearch = page.getByRole('combobox', {name: '搜索脚注'});
+        assert.equal(await largePickerList.getByRole('option').count(), 40);
+        assert.match(await page.locator('[data-picker-status]').textContent(), /1000 条脚注/);
+        await largePickerList.evaluate(el => {el.scrollTop = el.scrollHeight;});
+        await page.waitForFunction(() => document.querySelectorAll('[data-picker-key]').length === 80);
+        assert.equal(await page.evaluate(() => h.firstPickerRow === document.querySelector('[data-definition-id="picker-large-1"]')), true);
+        await page.locator('[data-definition-id="picker-large-75"]').click();
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        await largePickerList.evaluate(el => {el.scrollTop = el.scrollHeight;});
+        await page.waitForFunction(() => document.querySelectorAll('[data-picker-key]').length >= 120);
+        assert.equal(await page.locator('[data-definition-id="picker-large-75"]').getAttribute('aria-selected'), 'true');
+        await largePickerSearch.fill('[1000]');
+        assert.equal(await largePickerList.getByRole('option').count(), 1);
+        assert.equal(await largePickerList.getByRole('option').getAttribute('data-definition-id'), 'picker-large-1000');
+        await largePickerSearch.fill('');
+        assert.equal(await largePickerList.getByRole('option').count(), 40);
+        await largePickerSearch.press('ArrowUp');
+        assert.equal(await largePickerList.locator('[aria-selected="true"]').getAttribute('data-definition-id'), 'picker-large-1000');
+        assert.ok(await largePickerList.getByRole('option').count() <= 120);
+        assert.equal(await largePickerList.evaluate(el => {
+            const row = el.querySelector('[aria-selected="true"]').getBoundingClientRect();
+            const viewport = el.getBoundingClientRect();
+            return row.top >= viewport.top - 1 && row.bottom <= viewport.bottom + 1;
+        }), true, 'Keyboard selection must reveal an unloaded candidate');
+        await largePickerSearch.press('ArrowDown');
+        for (let i = 0; i < 40; i++) await largePickerSearch.press('ArrowDown');
+        assert.equal(await largePickerList.locator('[aria-selected="true"]').getAttribute('data-definition-id'), 'picker-large-41');
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        await page.screenshot({path: path.join(artifacts, 'footnote-picker-dynamic.png'), animations: 'disabled'});
+        await page.getByRole('button', {name: '插入脚注', exact: true}).click();
+        await page.waitForFunction(() => h.transactions.length === 1);
+        assert.equal(await page.evaluate(() => h.transactions[0].forward.length), 1);
+        assert.match(await page.evaluate(() => h.mainElement.firstElementChild.innerHTML), /data-id="picker-large-41"/);
+        console.log('Large insertion picker passed: 1000 candidates, initial 40 rows, automatic scrolling, full search, cross-batch keyboard navigation and explicit confirmation.');
+
+        // Search keeps focus in the combobox while reusing the saved slash range.
+        await page.evaluate(async () => {
+            await h.reset(h.block('body', '正文 /jz 末尾') + h.block('a', '[^12]: 第一条说明')
+                + h.block('b', '[^2]: ' + '长内容'.repeat(50) + ' needle keyword'));
+            h.command(3, 6); await h.manager.insert(h.main, h.mainElement.firstElementChild);
+        });
+        const pickerSearch = page.getByRole('combobox', {name: '搜索脚注'});
+        assert.equal(await pickerSearch.evaluate(el => el === document.activeElement), true);
+        await pickerSearch.fill('NEEDLE keyword');
+        assert.equal(await page.getByRole('option').count(), 1);
+        assert.equal(await page.getByRole('option').getAttribute('data-definition-id'), 'b');
+        await pickerSearch.fill('[12]');
+        assert.equal(await page.getByRole('option').getAttribute('data-definition-id'), 'a');
+        await pickerSearch.press('Enter');
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        assert.equal(await page.getByRole('button', {name: '插入脚注', exact: true}).evaluate(el => el === document.activeElement), true);
+        await page.getByRole('button', {name: '插入脚注', exact: true}).click();
+        await page.waitForFunction(() => h.transactions.length === 1);
+        assert.equal(await page.evaluate(() => h.transactions[0].forward.length), 1);
+        assert.equal(await page.evaluate(() => h.mainElement.firstElementChild.textContent), '正文 [^12] 末尾');
+
+        await page.evaluate(async () => {
+            await h.reset(h.block('body', '正文 /jz 末尾') + h.block('a', '[^1]: 原有说明'));
+            h.command(3, 6); await h.manager.insert(h.main, h.mainElement.firstElementChild);
+        });
+        await pickerSearch.fill('没有这个脚注');
+        await pickerSearch.press('Enter');
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        assert.match(await page.locator('[data-picker-status]').textContent(), /没有匹配/);
+        await page.getByRole('textbox', {name: '新脚注内容', exact: true}).fill('<b>直接填写的内容</b> & 第二行\n补充说明');
+        await page.screenshot({path: path.join(artifacts, 'footnote-picker-search.png'), animations: 'disabled'});
+        await page.getByRole('textbox', {name: '新脚注内容', exact: true}).press('Control+Enter');
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        await page.getByRole('button', {name: '新建脚注', exact: true}).click();
+        await page.waitForFunction(() => h.transactions.length === 1);
+        assert.equal(await page.evaluate(() => h.kernel.querySelector('[data-node-id="new-1"] b')), null);
+        assert.equal(await page.evaluate(() => h.kernel.querySelector('[data-node-id="new-1"] [contenteditable]').textContent), '[^2]: <b>直接填写的内容</b> & 第二行\n补充说明');
+        await page.evaluate(() => h.replay(h.transactions[0].undo));
+        assert.equal(await page.evaluate(() => h.mainElement.firstElementChild.textContent), '正文 /jz 末尾');
+        assert.equal(await page.evaluate(() => h.kernel.querySelector('[data-node-id="new-1"]')), null);
+
+        await page.evaluate(async () => {
+            h.command(3, 6); await h.manager.insert(h.main, h.mainElement.firstElementChild);
+        });
+        await pickerSearch.fill('取消时保留正文');
+        await pickerSearch.press('Escape');
+        assert.equal(await page.getByRole('dialog').count(), 0);
+        assert.equal(await page.evaluate(() => getSelection().toString()), '/jz');
+
         // Real Range: insert at a nonzero position in an existing paragraph.
         assert.equal(await page.evaluate(() => h.api.Lute), undefined);
         await page.evaluate(async () => {
             await h.reset(h.block("body", "正文 /脚注 末尾") + h.block("a", "[^1]: 已有脚注。"));
+            h.manager.sidebar.showPanel("settings");
             h.command(3, 6);
             await h.plugin.protyleSlash[0].callback(h.main, h.mainElement.firstElementChild);
         });
-        assert.deepEqual(await page.evaluate(() => h.messages.filter(message => /NewNodeID|生成器/.test(message))), []);
-        await page.waitForFunction(() => h.transactions.length === 1);
-        const visibleMarker = await page.evaluate(() => h.mainElement.querySelector('[data-type="block-ref"][data-id="new-1"]')?.textContent);
-        assert.equal(visibleMarker, "[2]", "The edited paragraph must show the inserted footnote without reloading");
+        await page.waitForFunction(() => !document.querySelector('[data-picker-submit]').disabled);
+        await page.screenshot({path: path.join(artifacts, "footnote-picker.png"), animations: "disabled"});
+        await page.locator('[data-definition-id="a"]').click();
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        assert.equal(await page.locator('[data-picker-submit]').textContent(), '插入脚注');
+        await page.locator('[data-picker-create]').click();
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        assert.equal(await page.locator('[data-picker-submit]').textContent(), '新建脚注');
+        await page.screenshot({path: path.join(artifacts, 'footnote-picker-create.png'), animations: 'disabled'});
+        await page.locator('[data-picker-submit]').click();
+        await page.waitForFunction(() => h.transactions.length === 1 || h.messages.length > 0);
+        assert.equal(await page.evaluate(() => h.transactions.length), 1,
+            JSON.stringify(await page.evaluate(() => ({messages: h.messages, status: document.querySelector('[data-picker-status]')?.textContent,
+                body: h.mainElement.innerHTML, busy: h.manager.busy}))));
+        const visibleMarker = await page.evaluate(() => h.mainElement.querySelector('[data-type~="block-ref"][data-id="new-1"]')?.textContent);
+        assert.equal(visibleMarker, "[^2]", "The edited paragraph must show the inserted footnote without reloading");
         assert.doesNotMatch(await page.evaluate(() => h.mainElement.textContent), /\/脚注/);
-        assert.match(await page.evaluate(() => h.main.protyle.wysiwyg.lastHTMLs.body), /\[2\]/);
+        assert.match(await page.evaluate(() => h.main.protyle.wysiwyg.lastHTMLs.body), /\[\^2\]/);
         await page.evaluate(() => h.manager.refresh());
         await page.waitForFunction(() => h.nativeEditors.at(-1).options.blockId === "new-1" && document.activeElement.closest('[data-footnote-sidebar]'));
         const insertion = await page.evaluate(() => ({html: h.kernel.innerHTML, tx: h.transactions[0]}));
         assert.equal(insertion.tx.forward.length, 3);
         assert.equal(insertion.tx.undo.length, 3);
-        assert.match(insertion.html, /正文 <span[^>]+data-id="new-1"[^>]*>\[2\]<\/span> 末尾/);
+        assert.match(insertion.html, /正文 <span[^>]+data-id="new-1"[^>]*>\[\^2\]<\/span> 末尾/);
         await page.evaluate(() => h.replay(h.transactions[0].undo));
         assert.match(await page.evaluate(() => h.mainElement.textContent), /正文 \/脚注 末尾/);
         assert.equal(await page.evaluate(() => h.mainElement.querySelector('[data-id="new-1"]')), null);
@@ -440,10 +612,10 @@ function setupHost(modules) {
         await page.evaluate(async () => {
             await h.reset(h.block("body", "末段 /jz"));
             h.command(3, 6);
-            await h.manager.insert(h.main, h.mainElement.firstElementChild);
+            await h.manager.insert(h.main, h.mainElement.firstElementChild); await h.chooseNew();
         });
         assert.equal(await page.evaluate(() => h.transactions.length), 1);
-        assert.equal(await page.evaluate(() => h.mainElement.querySelectorAll('[data-type="block-ref"]').length), 1);
+        assert.equal(await page.evaluate(() => h.mainElement.querySelectorAll('[data-type~="block-ref"]').length), 1);
         assert.equal(await page.evaluate(() => h.mainElement.children.length), 3);
         assert.equal(await page.evaluate(() => h.mainElement.querySelectorAll('[data-type="NodeHeading"]').length), 1);
         assert.doesNotMatch(await page.evaluate(() => h.mainElement.textContent), /\/jz/);
@@ -456,11 +628,11 @@ function setupHost(modules) {
             const source = h.block("body", "正文 /jz");
             await h.reset(source + h.block("unloaded-tail", "未加载的文末"), source);
             h.command(3, 6);
-            await h.manager.insert(h.main, h.mainElement.firstElementChild);
+            await h.manager.insert(h.main, h.mainElement.firstElementChild); await h.chooseNew();
         });
         assert.equal(await page.evaluate(() => h.transactions.length), 1);
         assert.equal(await page.evaluate(() => h.mainElement.children.length), 1);
-        assert.equal(await page.evaluate(() => h.mainElement.querySelectorAll('[data-type="block-ref"]').length), 1);
+        assert.equal(await page.evaluate(() => h.mainElement.querySelectorAll('[data-type~="block-ref"]').length), 1);
         assert.equal(await page.evaluate(() => h.kernel.children.length), 4);
 
         // A synchronous host failure restores the command, selection and local blocks.
@@ -469,7 +641,7 @@ function setupHost(modules) {
             h.command(3, 6);
             const transaction = h.main.transaction;
             h.main.transaction = () => {throw new Error("宿主事务提交失败");};
-            try {await h.manager.insert(h.main, h.mainElement.firstElementChild);}
+            try {await h.manager.insert(h.main, h.mainElement.firstElementChild); await h.chooseNew();}
             finally {h.main.transaction = transaction;}
         });
         assert.equal(await page.evaluate(() => h.transactions.length), 0);
@@ -484,7 +656,7 @@ function setupHost(modules) {
             h.command(3, 6);
             const lute = window.Lute;
             delete window.Lute;
-            try {await h.manager.insert(h.main, h.mainElement.firstElementChild);}
+            try {await h.manager.insert(h.main, h.mainElement.firstElementChild); await h.chooseNew();}
             finally {window.Lute = lute;}
         });
         assert.equal(await page.evaluate(() => h.transactions.length), 0);
@@ -500,7 +672,48 @@ function setupHost(modules) {
         await page.evaluate(() => {h.command(0, 0); h.finish();});
         await page.evaluate(() => h.work);
         assert.equal(await page.evaluate(() => h.transactions.length), 0);
-        assert.match(await page.evaluate(() => h.messages.at(-1)), /光标位置已改变/);
+        // Dialog focus and a moved live selection do not invalidate the saved slash position.
+        await page.evaluate(() => h.chooseNew());
+        assert.equal(await page.evaluate(() => h.transactions.length), 1);
+
+        await page.evaluate(async () => {
+            await h.reset(h.block('body', '正文 /jz 后') + h.block('d', '[^8]: 可以复用'));
+            h.main.flushPendingTransactions = () => new Promise(() => {});
+            h.mainElement.insertAdjacentHTML('beforeend', h.block('queued', '还没保存的块'));
+            h.command(3, 6); await h.manager.insert(h.main, h.mainElement.firstElementChild);
+        });
+        await page.locator('[data-definition-id="d"]').click();
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        await page.getByRole('button', {name: '插入脚注', exact: true}).click();
+        await page.waitForFunction(() => h.transactions.length === 1);
+        assert.equal(await page.evaluate(() => h.transactions[0].forward.length), 1);
+        assert.match(await page.evaluate(() => h.mainElement.firstElementChild.textContent), /正文 \[\^8\] 后/);
+        await page.evaluate(() => {delete h.main.flushPendingTransactions;});
+
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole('combobox', {name: '目标脚注写法'}).selectOption('text');
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.locator('[data-live-refresh]').uncheck();
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        assert.equal(await page.locator('[data-action="refresh"]').isVisible(), true);
+        await page.evaluate(async () => {
+            await h.reset(h.block('body', '正文 [^1]') + h.block('d', '[^1]: 内容'));
+            h.command(7, 7); h.jumper.activeBlock = h.mainElement.firstElementChild;
+            h.jumper.activeBlockId = 'body'; h.jumper.markAllBlocksDirty(); h.jumper.refresh();
+            h.manualCaret = h.jumper.captureSelection(h.mainElement.firstElementChild);
+            if (h.mainElement.firstElementChild.querySelector('.siyuan-footnote-ref')) throw Error('Active block refreshed automatically');
+        });
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.locator('[data-action="refresh"]').click();
+        await page.waitForFunction(() => Boolean(h.mainElement.firstElementChild.querySelector('.siyuan-footnote-ref')));
+        assert.deepEqual(await page.evaluate(() => h.jumper.captureSelection(h.mainElement.firstElementChild)),
+            await page.evaluate(() => h.manualCaret));
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.locator('[data-live-refresh]').check();
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole('combobox', {name: '目标脚注写法'}).selectOption('block');
+        assert.equal(await page.locator('[data-action="refresh"]').isVisible(), false);
+        assert.equal(await page.locator('.main .siyuan-footnote-ref').count(), 0);
 
         // Closing releases the native editor; reopening restores the selection.
         await page.evaluate(async () => {
@@ -511,13 +724,71 @@ function setupHost(modules) {
         await page.evaluate(() => h.manager.open());
         await page.waitForFunction(() => Boolean(h.manager.sidebar.protyle));
 
+        // Exercise the new controls and native superscript without applying a
+        // second size/vertical offset in the navigation enhancement.
+        await page.addStyleTag({content: '.protyle-wysiwyg [data-type~="sup"]{font-size:.75em;vertical-align:super}'});
+        await page.evaluate(async () => {
+            await h.reset(h.block("body", '<span data-type="strong text" style="color:red">前 [^12] 后</span>') + h.block("d", "[^12]: 内容"));
+        });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole("combobox", {name: "目标脚注写法"}).selectOption("block");
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole("combobox", {name: "静态块引编号样式"}).selectOption("brackets");
+        const blockDefinition = await page.locator('[data-definition-format]').inputValue();
+        assert.equal(await page.locator('select option[value="keep"]').count(), 0);
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.locator('[data-superscript]').check();
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole("button", {name: "统一格式", exact: true}).click();
+        await page.evaluate(() => h.confirmations.at(-1).callback());
+        await page.waitForFunction(() => h.transactions.length === 1);
+        await page.evaluate(() => {
+            const block = h.mainElement.querySelector('[data-node-id="body"]');
+            const native = block.querySelector('[data-type~="block-ref"]');
+            if (native.textContent !== '[1]' || !native.matches('[data-type~="sup"][data-type~="strong"]')) throw Error('Native sup/style controls were not applied');
+            if (native.style.color !== 'red' || native.dataset.id !== 'd') throw Error('Inline style or target lost');
+            const before = getComputedStyle(native).fontSize;
+            h.jumper.styleNativeFootnotes(block, h.jumper.collectDefinitions(h.mainElement));
+            if (native.classList.contains('siyuan-footnote-native-ref') || getComputedStyle(native).fontSize !== before) throw Error('Native sup was enhanced twice');
+        });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole("combobox", {name: "目标脚注写法"}).selectOption("text");
+        assert.equal(await page.locator('[data-block-label]').isDisabled(), true);
+        assert.equal(await page.locator('[data-block-label-field]').isVisible(), false);
+        assert.equal(await page.locator('[data-definition-format-field]').isVisible(), false);
+        assert.equal(await page.locator('[data-text-format-hint]').isVisible(), true);
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole("button", {name: "统一格式", exact: true}).click();
+        await page.evaluate(() => h.confirmations.at(-1).callback());
+        await page.waitForFunction(() => h.transactions.length === 2);
+        await page.evaluate(() => {
+            const block = h.mainElement.querySelector('[data-node-id="body"]');
+            const sup = block.querySelector('[data-type~="sup"]');
+            if (h.kernel.querySelector('[data-type="NodeList"]') || !h.kernel.textContent.includes('[^1]: 内容')) throw Error('Text references must use fixed definitions');
+            const before = getComputedStyle(sup).fontSize;
+            h.jumper.wrapReferences(block, h.jumper.collectDefinitions(h.mainElement));
+            const enhanced = block.querySelector('.siyuan-footnote-ref--native-sup');
+            if (!enhanced || enhanced.dataset.preview !== '内容') throw Error('Native sup text navigation missing');
+            if (getComputedStyle(enhanced).fontSize !== before || getComputedStyle(enhanced).verticalAlign !== 'baseline') throw Error('Text sup was enhanced twice');
+        });
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole("combobox", {name: "目标脚注写法"}).selectOption("block");
+        assert.equal(await page.locator('[data-block-label-field]').isVisible(), true);
+        assert.equal(await page.locator('[data-definition-format-field]').isVisible(), true);
+        assert.equal(await page.locator('[data-definition-format]').inputValue(), blockDefinition);
+        assert.equal(await page.locator('[data-block-label]').inputValue(), "brackets");
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.getByRole("combobox", {name: "静态块引编号样式"}).selectOption("caret");
+        await page.getByRole("tab", {name: "设置", exact: true}).click();
+        await page.locator('[data-superscript]').uncheck();
+
         // Optionally verify the actual Lute shipped with an installed SiYuan.
         if (process.env.FOOTNOTE_LUTE_SCRIPT) {
             await page.addScriptTag({content: fs.readFileSync(process.env.FOOTNOTE_LUTE_SCRIPT, "utf8")});
             await page.evaluate(async () => {
                 await h.reset(h.block("body", "正文 /脚注 末尾"));
                 h.command(3, 6);
-                await h.manager.insert(h.main, h.mainElement.firstElementChild);
+                await h.manager.insert(h.main, h.mainElement.firstElementChild); await h.chooseNew();
             });
             const tx = await page.evaluate(() => h.transactions[0]);
             assert.ok(tx, "Insertion should use the installed SiYuan Lute without a module export");
@@ -529,6 +800,138 @@ function setupHost(modules) {
             console.log("Installed SiYuan Lute check passed: real block IDs generated and insertion submitted.");
         }
 
+        // A large document keeps full counts, but creates only the first batches of rows.
+        await page.evaluate(async () => {
+            const notes = Array.from({length: 1000}, (_, i) => h.block(`large-note-${i}`, `[^${i + 1}]: 脚注内容 ${i + 1}`));
+            const body = h.block('large-body', Array.from({length: 1000}, (_, i) => `[^${i + 1}]`).join(' '));
+            const paragraphs = Array.from({length: 125}, (_, i) => h.block(`large-ref-${i}`, `被引段落 ${i + 1} [^1]`));
+            h.manager.revision++;
+            await h.reset(body + paragraphs.join('') + notes.join(''));
+        });
+        await page.waitForFunction(() => document.querySelectorAll('[data-note-key]').length === 40);
+        assert.equal(await page.locator('.siyuan-footnote-sidebar__reference').count(), 30);
+        assert.match(await page.locator('.siyuan-footnote-sidebar__status').textContent(), /1000 个脚注 · 1125 处引用/);
+        await page.evaluate(() => {
+            h.largeRow = document.querySelector('[data-note-key="large-note-0"]');
+            h.largeReference = document.querySelector('.siyuan-footnote-sidebar__reference');
+            h.largeEditor = h.manager.sidebar.protyle;
+            const list = document.querySelector('.siyuan-footnote-sidebar__list'); list.scrollTop = list.scrollHeight;
+        });
+        await page.waitForFunction(() => document.querySelectorAll('[data-note-key]').length === 80);
+        await page.evaluate(() => {
+            const panel = document.querySelector('[data-panel-content="notes"]'); panel.scrollTop = panel.scrollHeight;
+        });
+        await page.waitForFunction(() => document.querySelectorAll('.siyuan-footnote-sidebar__reference').length >= 60);
+        await page.evaluate(async () => {
+            h.largeRow.focus(); await h.manager.refresh();
+            if (document.querySelector('[data-note-key="large-note-0"]') !== h.largeRow) throw Error('Unchanged note DOM was replaced');
+            if (document.querySelector('.siyuan-footnote-sidebar__reference') !== h.largeReference) throw Error('Unchanged reference DOM was replaced');
+            if (h.manager.sidebar.protyle !== h.largeEditor) throw Error('Native editor was recreated');
+            if (document.activeElement !== h.largeRow) throw Error('List focus was lost during refresh');
+        });
+        const retainedNotes = await page.evaluate(() => ({editor: h.manager.sidebar.protyle === h.largeEditor,
+            scroll: document.querySelector('.siyuan-footnote-sidebar__list').scrollTop}));
+        await page.getByRole('tab', {name: '设置', exact: true}).click();
+        await page.evaluate(() => h.manager.refresh());
+        await page.getByRole('tab', {name: '脚注', exact: true}).click();
+        assert.equal(await page.evaluate(() => h.manager.sidebar.protyle === h.largeEditor), retainedNotes.editor);
+        assert.equal(await page.evaluate(() => document.querySelector('.siyuan-footnote-sidebar__list').scrollTop), retainedNotes.scroll);
+        // One lookup must leave the actual row inside both scrolling viewports after lazy-loading callbacks.
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.getByRole('textbox', {name: '脚注编号', exact: true}).fill('467');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.locator('[data-action="locate-number"]').click();
+        await page.evaluate(async () => {for (let frame = 0; frame < 8; frame++) await new Promise(requestAnimationFrame);});
+        const located467 = await page.evaluate(() => {
+            const row = document.querySelector('[data-note-key="large-note-466"]');
+            const list = document.querySelector('.siyuan-footnote-sidebar__list').getBoundingClientRect();
+            const panel = document.querySelector('#dock').getBoundingClientRect();
+            const bounds = row?.getBoundingClientRect();
+            return {visible: Boolean(bounds && bounds.top >= Math.max(list.top, panel.top, 0) - 1
+                    && bounds.bottom <= Math.min(list.bottom, panel.bottom, innerHeight) + 1),
+                rowTop: bounds?.top, rowBottom: bounds?.bottom, listTop: list.top, listBottom: list.bottom,
+                selected: row?.getAttribute('aria-pressed'), rendered: document.querySelectorAll('[data-note-key]').length};
+        });
+        assert.equal(located467.visible, true, `One-click lookup of 467 drifted out of view: ${JSON.stringify(located467)}`);
+        assert.equal(located467.selected, 'true');
+        const assertLocatedRow = async label => {
+            const result = await page.evaluate(label => {
+                const row = document.querySelector(`[data-note-key="large-note-${Number(label) - 1}"]`);
+                const list = document.querySelector('.siyuan-footnote-sidebar__list').getBoundingClientRect();
+                const panel = document.querySelector('#dock').getBoundingClientRect();
+                const header = document.querySelector('#dock .block__icons').getBoundingClientRect();
+                const bounds = row?.getBoundingClientRect();
+                return {visible: Boolean(bounds && bounds.top >= Math.max(list.top, panel.top, header.bottom, 0) - 1
+                        && bounds.bottom <= Math.min(list.bottom, panel.bottom, innerHeight) + 1),
+                    selected: row?.getAttribute('aria-pressed'), rowTop: bounds?.top, rowBottom: bounds?.bottom,
+                    listTop: list.top, listBottom: list.bottom};
+            }, label);
+            assert.equal(result.visible, true, `Lookup of ${label} left its viewport: ${JSON.stringify(result)}`);
+            assert.equal(result.selected, 'true');
+        };
+        for (const [index, label] of ['40', '41', '467', '480', '1000'].entries()) {
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+            await page.getByRole('textbox', {name: '脚注编号', exact: true}).fill(label);
+            if (index % 2) await page.getByRole('textbox', {name: '脚注编号', exact: true}).press('Enter');
+            else await page.locator('[data-action="locate-number"]').click();
+            await page.evaluate(async () => {
+                for (let frame = 0; frame < 8; frame++) await new Promise(requestAnimationFrame);
+                await h.manager.refresh();
+                for (let frame = 0; frame < 8; frame++) await new Promise(requestAnimationFrame);
+            });
+            await assertLocatedRow(label);
+        }
+        await page.setViewportSize({width: 1100, height: 600});
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.getByRole('textbox', {name: '脚注编号', exact: true}).fill('467');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.getByRole('textbox', {name: '脚注编号', exact: true}).press('Enter');
+        await page.evaluate(async () => {for (let frame = 0; frame < 8; frame++) await new Promise(requestAnimationFrame);});
+        await assertLocatedRow('467');
+        await page.setViewportSize({width: 1100, height: 850});
+        console.log('One-click lookup passed: 40, 41, 467, 480, 1000 stay visible after lazy loading and refresh, including a 600px viewport.');
+        // Upward scrolling loads earlier rows without a loading button or viewport drift.
+        assert.equal(await page.getByRole('button', {name: /加载/}).count(), 0);
+        await page.evaluate(() => {
+            const list = document.querySelector('.siyuan-footnote-sidebar__list');
+            h.beforeEarlier = Number(list.querySelector('[data-note-key]').dataset.noteKey.split('-').at(-1));
+            list.scrollTop = 0;
+        });
+        await page.waitForFunction(() => Number(document.querySelector('[data-note-key]').dataset.noteKey.split('-').at(-1)) < h.beforeEarlier);
+        const anchoredEarlier = await page.evaluate(() => {
+            const list = document.querySelector('.siyuan-footnote-sidebar__list');
+            const row = document.querySelector(`[data-note-key="large-note-${h.beforeEarlier}"]`);
+            return Math.abs(row.getBoundingClientRect().top - list.getBoundingClientRect().top) < 5 && list.scrollTop > 0;
+        });
+        assert.equal(anchoredEarlier, true, 'Prepending an earlier batch must retain the visible row');
+        // Number lookup must reach unloaded rows while retaining bounded rendering.
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.getByRole('textbox', {name: '脚注编号', exact: true}).fill('[^1000]');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.getByRole('textbox', {name: '脚注编号', exact: true}).press('Enter');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.waitForFunction(() => document.querySelector('[data-note-key="large-note-999"]')?.getAttribute('aria-pressed') === 'true');
+        assert.equal(await page.locator('[data-note-key="large-note-999"]').isVisible(), true);
+        assert.equal(await page.evaluate(() => h.manager.sidebar.protyle.wysiwyg.element.firstElementChild.dataset.nodeId), 'large-note-999');
+        assert.ok(await page.locator('[data-note-key]').count() < 200, 'Lookup must not load all 1000 rows');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.getByRole('textbox', {name: '脚注编号', exact: true}).fill('不存在');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.locator('[data-action="locate-number"]').click();
+        assert.match(await page.locator('[data-locate-status]').textContent(), /未找到/);
+        assert.equal(await page.locator('[data-note-key="large-note-999"]').getAttribute('aria-pressed'), 'true');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.getByRole('textbox', {name: '脚注编号', exact: true}).fill('[1]');
+        await page.getByRole("tab", {name: "脚注", exact: true}).click();
+        await page.locator('[data-action="locate-number"]').click();
+        assert.equal(await page.locator('[data-note-key="large-note-0"]').getAttribute('aria-pressed'), 'true');
+        assert.equal(await page.evaluate(() => h.transactions.length), 0);
+        console.log('Large sidebar passed: 1000 notes and 1125 references indexed, initial note/reference rows 40/30, scroll loading and DOM/focus reuse.');
+        await page.evaluate(async () => {
+            h.manager.revision++;
+            await h.reset(h.block('body', '正文 [^1]') + h.block('d', '[^1]: 内容'));
+            document.querySelector('[data-panel-content="notes"]').scrollTop = 0;
+        });
         await page.setViewportSize({width: 390, height: 844});
         await page.evaluate(() => {
             h.frontend = "browser-mobile";
@@ -544,6 +947,7 @@ function setupHost(modules) {
             document.documentElement.style.setProperty("--b3-theme-on-primary", "#17213e");
             document.documentElement.style.setProperty("--b3-border-color", "#424b5b");
         });
+        await assertMatchingCards();
         await page.screenshot({path: path.join(artifacts, "sidebar-mobile-dark.png"), animations: "disabled"});
         assert.equal(await page.evaluate(() => document.querySelector("#dock").scrollWidth > 390), false);
         await page.evaluate(() => {
@@ -563,6 +967,6 @@ function setupHost(modules) {
         await page.waitForFunction(() => h.mobileOpen === "testfootnotes" && Boolean(h.manager.sidebar.protyle));
         await page.evaluate(() => h.manager.destroy());
         assert.equal(errors.length, 0, errors.join("\n"));
-        console.log("Browser checks passed: definition format conversion, ordered-list reorder warning and number refresh, Range insertion, caret-change guard, sidebar selection/navigation, normalization, close/reopen, mobile dock opening and 390px layout.");
+        console.log("Browser checks passed: definition format conversion, ordered-list reorder warning and number refresh, picker reuse/creation/cancel and saved ranges, pending saves, manual refresh and caret preservation, sidebar selection/navigation, normalization, close/reopen, mobile dock opening and 390px layout.");
     } finally {await browser.close();}
 })().catch(error => {console.error(error); process.exitCode = 1;});

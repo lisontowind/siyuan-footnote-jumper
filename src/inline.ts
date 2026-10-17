@@ -9,6 +9,27 @@ export function readMarkers(nodes: Text[]) {
     return matches;
 }
 
+/** Native superscript can be on the marker, an ancestor, or split inline text. */
+export function isSuperscript(element: HTMLElement): boolean {
+    for (let node = element; node && !node.hasAttribute("data-node-id"); node = node.parentElement) {
+        if (node.matches('sup, [data-type~="sup"]') || node.style.verticalAlign === "super") return true;
+    }
+    return false;
+}
+
+export function markerIsSuperscript(nodes: Text[], start: number, end: number): boolean {
+    let offset = 0, found = false;
+    for (const node of nodes) {
+        const next = offset + node.data.length;
+        if (next > start && offset < end) {
+            if (!isSuperscript(node.parentElement)) return false;
+            found = true;
+        }
+        offset = next;
+    }
+    return found;
+}
+
 // Formatting may divide a marker across nodes. Code, native refs, cells and
 // nested blocks always separate runs so markers cannot cross those boundaries.
 export function visitInline(block: HTMLElement, onRun: (nodes: Text[]) => void,
@@ -58,7 +79,7 @@ export function replaceTextRun(nodes: Text[], start: number, end: number, replac
 
 /** Wrap one marker while retaining its rich inline content. Split only the
  * boundary ancestors; each marker remains one clickable element. */
-export function wrapTextRun(nodes: Text[], start: number, end: number, wrapper: HTMLElement) {
+export function wrapTextRun(nodes: Text[], start: number, end: number, wrapper: HTMLElement, boundary?: HTMLElement) {
     let offset = 0, first: Text, last: Text, from = 0, to = 0;
     for (const node of nodes) {
         const length = node.data.length;
@@ -101,5 +122,19 @@ export function wrapTextRun(nodes: Text[], start: number, end: number, wrapper: 
         wrapper.appendChild(left);
         if (left === right) break;
         left = next;
+    }
+    // Lift the isolated marker, carrying a clone of each style ancestor inside
+    // it. Surrounding text keeps its original ancestors and formatting.
+    while (boundary && wrapper.parentElement !== boundary) {
+        const parent = wrapper.parentElement;
+        const after = parent.cloneNode(false) as HTMLElement;
+        while (wrapper.nextSibling) after.append(wrapper.nextSibling);
+        const selectedParent = parent.cloneNode(false);
+        while (wrapper.firstChild) selectedParent.appendChild(wrapper.firstChild);
+        wrapper.append(selectedParent);
+        parent.after(wrapper, after);
+        for (const node of [parent, after]) {
+            if (!node.textContent && !node.querySelector("br, img, svg, input, [data-node-id]")) node.remove();
+        }
     }
 }

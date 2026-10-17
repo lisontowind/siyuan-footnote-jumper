@@ -1,9 +1,10 @@
-import {confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Plugin, Protyle, showMessage} from "siyuan";
-import {applyInsertionToEditor, applyNormalizationToEditor, buildDocumentSnapshot, documentContentSignature, DocumentSnapshot, NormalizationOptions, prepareInsertion, prepareNormalization} from "./document";
-import {FootnoteSidebar} from "./sidebar";
+import {Dialog, confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Plugin, Protyle, showMessage} from "siyuan";
+import {applyInsertionToEditor, applyNormalizationToEditor, auditFootnoteFormat, buildDocumentSnapshot, documentContentSignature, DEFAULT_PREFERENCES, DocumentSnapshot, FootnotePreferences, includeQueuedBlocks, NormalizationOptions, prepareInsertion, prepareNormalization, resolveNormalizationOptions} from "./document";
+import {FootnoteSidebar, IncrementalList} from "./sidebar";
 import {flushDocumentEdits} from "./editing";
 
 const DOCK_TYPE = "footnotes";
+let pickerSequence = 0;
 const escapeHTML = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 const transactionSignature = (transaction: ReturnType<typeof prepareNormalization>) => JSON.stringify(transaction,
@@ -15,6 +16,12 @@ interface ManagerHost {
     changed(rootId: string): void;
     jumpEnabled(): boolean;
     setJumpEnabled(enabled: boolean): void;
+    preferences?(): FootnotePreferences;
+    setPreferences?(preferences: FootnotePreferences): void;
+    liveRefresh?(): boolean;
+    setLiveRefresh?(enabled: boolean): void;
+    manualRefresh?(editor: Protyle): void | Promise<void>;
+    checkDuplicates?(anchor: HTMLElement, editor?: Protyle): void;
 }
 
 export class FootnoteManager {
@@ -29,8 +36,12 @@ export class FootnoteManager {
     private request = 0;
     private visibility?: MutationObserver;
     private visible = false;
-    private pendingSelection?: {rootId: string; blockId: string};
+    private pendingSelection?: {rootId: string; blockId: string; focus?: boolean};
     private snapshot?: DocumentSnapshot;
+    private formatIssues: string[] = [];
+    private refreshing?: {editor?: Protyle; rootId?: string; promise?: Promise<void>; revision: number; request: number; rerun: boolean};
+    private insertionDialog?: Dialog;
+    private manualRefreshPending = false;
     private previousLabels = new Map<string, Map<string, string>>();
 
     constructor(private plugin: Plugin, private host: ManagerHost) {}
@@ -44,7 +55,16 @@ export class FootnoteManager {
                 this.sidebar = new FootnoteSidebar(dock.element as HTMLElement, this.plugin.app, {
                     navigate: (id) => void this.host.navigate(id).catch((error) => this.error(error)),
                     normalize: (options) => void this.normalize(options),
-                    refresh: () => this.schedule(0), ready: () => this.schedule(1000),
+                    refresh: () => {
+                        this.manualRefreshPending = true;
+                        this.performManualRefresh();
+                    },
+                    preferences: () => this.host.preferences?.() || DEFAULT_PREFERENCES,
+                    setPreferences: (preferences) => {this.host.setPreferences?.(preferences); this.schedule(0);},
+                    liveRefresh: () => this.host.liveRefresh?.() ?? true,
+                    setLiveRefresh: (enabled) => this.host.setLiveRefresh?.(enabled),
+                    checkDuplicates: (anchor) => this.host.checkDuplicates?.(anchor, this.main),
+                    ready: () => this.schedule(1000),
                     readonly: () => this.readonly(),
                     jumpEnabled: () => this.host.jumpEnabled(),
                     setJumpEnabled: (enabled) => this.host.setJumpEnabled(enabled),
@@ -81,6 +101,20 @@ export class FootnoteManager {
     }
 
     updateJumpStyle(enabled: boolean) {this.sidebar?.setJumpEnabled(enabled);}
+
+    updatePreferences() {
+        this.sidebar?.setPreferences(this.host.preferences?.() || DEFAULT_PREFERENCES);
+        this.sidebar?.setLiveRefresh(this.host.liveRefresh?.() ?? true);
+        this.schedule(0);
+    }
+
+    private performManualRefresh() {
+        if (!this.manualRefreshPending || this.composing) return;
+        this.manualRefreshPending = false;
+        if (this.main) {
+            Promise.resolve(this.host.manualRefresh?.(this.main)).then(() => this.schedule(0), (error) => this.error(error));
+        }
+    }
 
     private readonly handleSwitch = (event: CustomEvent<{protyle: IProtyle}>) => {
         const protyle = event.detail.protyle;
@@ -162,7 +196,7 @@ export class FootnoteManager {
     };
 
     private readonly handleCompositionStart = () => {this.composing = true;};
-    private readonly handleCompositionEnd = () => {this.composing = false; this.revision++; this.schedule(1000);};
+    private readonly handleCompositionEnd = () => {this.composing = false; this.revision++; this.performManualRefresh(); this.schedule(1000);};
     private readonly handlePointer = (event: PointerEvent) => {
         const editorElement = (event.target as HTMLElement)?.closest?.(".protyle-wysiwyg");
         if (!editorElement || editorElement.closest("[data-footnote-sidebar]")) return;
@@ -209,7 +243,7 @@ export class FootnoteManager {
             () => this.assertWritable(editor), (block) => this.host.tablePending(block));
     }
 
-    private async read(editor: Protyle) {
+    private async read(editor: Protyle, insertion = false) {
         const rootId = editor.protyle.block.rootID;
         const response = await fetchSyncPost("/api/block/getBlockDOM", {id: rootId});
         if (response.code !== 0 || typeof response.data?.dom !== "string" || !response.data.dom.trim()) {
@@ -222,8 +256,9 @@ export class FootnoteManager {
             if (editor.protyle.wysiwyg.element.contains(document.activeElement)) overlays.unshift(side.wysiwyg.element);
             else overlays.push(side.wysiwyg.element);
         }
+        const dom = insertion ? includeQueuedBlocks(response.data.dom, overlays) : response.data.dom;
         const previous = this.previousLabels.get(rootId) || new Map<string, string>();
-        let snapshot = buildDocumentSnapshot(rootId, response.data.dom, overlays, new Set(), previous);
+        let snapshot = buildDocumentSnapshot(rootId, dom, overlays, new Set(), previous);
         // Distinguish dangling footnote-shaped refs from refs into other documents.
         const targets = Array.from(new Set(snapshot.notes.filter((note) => note.missing).reduce<string[]>((all, note) =>
             all.concat(note.references.filter((ref) => ref.kind === "block").map((ref) => ref.targetId)), []).filter(Boolean)));
@@ -234,33 +269,55 @@ export class FootnoteManager {
             if (result.code !== 0 || !Array.isArray(result.data)) throw new Error("读取块引目标失败，请重试");
             for (const row of result.data) if (row.root_id !== rootId) ignored.add(row.id);
         }
-        if (ignored.size) snapshot = buildDocumentSnapshot(rootId, response.data.dom, overlays, ignored, previous);
+        if (ignored.size) snapshot = buildDocumentSnapshot(rootId, dom, overlays, ignored, previous);
         for (const note of snapshot.notes) if (note.blockId && !previous.has(note.blockId)) previous.set(note.blockId, note.label);
         this.previousLabels.set(rootId, previous);
         return snapshot;
     }
 
     private schedule(delay: number) {
-        if (this.disposed || !this.visible) return;
+        if (this.disposed) return;
         window.clearTimeout(this.timer);
         this.timer = window.setTimeout(() => {this.timer = 0; void this.refresh();}, delay);
     }
 
     private async refresh() {
         this.captureMain();
-        if (!this.visible || !this.sidebar || this.disposed) return;
+        if (this.disposed) return;
+        const current = this.refreshing;
+        if (current && current.editor === this.main && current.rootId === this.mainRootId) {
+            current.rerun = current.rerun || current.revision !== this.revision || current.request !== this.request;
+            return current.promise;
+        }
+        const state = {editor: this.main, rootId: this.mainRootId, promise: undefined as Promise<void>, revision: this.revision, request: this.request, rerun: false};
+        this.refreshing = state;
+        state.promise = this.refreshOnce();
+        state.request = this.request;
+        try {await state.promise;}
+        finally {
+            if (this.refreshing === state) {
+                this.refreshing = undefined;
+                if (state.rerun) this.schedule(0);
+            }
+        }
+    }
+
+    private async refreshOnce() {
+        if (this.disposed) return;
         if (this.composing || this.busy) {this.schedule(1000); return;}
         const editor = this.main;
-        if (!editor?.protyle?.wysiwyg?.element?.isConnected) {this.sidebar.clear(); return;}
+        if (!editor?.protyle?.wysiwyg?.element?.isConnected) {this.sidebar?.clear(); return;}
         const request = ++this.request, revision = this.revision;
         try {
             const snapshot = await this.read(editor);
-            if (this.disposed || !this.visible || this.main !== editor || request !== this.request) return;
+            if (this.disposed || this.main !== editor || request !== this.request) return;
             if (revision !== this.revision) {this.schedule(1000); return;}
             this.snapshot = snapshot;
+            this.formatIssues = auditFootnoteFormat(snapshot, this.host.preferences?.() || DEFAULT_PREFERENCES);
+            if (!this.visible || !this.sidebar) return;
             if (this.pendingSelection?.rootId === snapshot.rootId
                 && snapshot.notes.some((note) => note.blockId === this.pendingSelection.blockId)) {
-                this.sidebar.selectNew(this.pendingSelection.blockId);
+                this.sidebar.selectNew(this.pendingSelection.blockId, this.pendingSelection.focus ?? true);
                 this.pendingSelection = undefined;
             }
             this.sidebar.render(snapshot, editor.protyle.title?.editElement?.textContent || "当前文档");
@@ -290,6 +347,7 @@ export class FootnoteManager {
                 this.sidebar?.render(snapshot, editor.protyle.title?.editElement?.textContent || "当前文档");
             }
             const allocated: string[] = [];
+            options = resolveNormalizationOptions(snapshot, options);
             const transaction = prepareNormalization(snapshot, options, () => {
                 if (typeof window.Lute?.NewNodeID !== "function") throw new Error("思源块 ID 生成器尚未就绪，请重试");
                 const id = window.Lute.NewNodeID(); allocated.push(id); return id;
@@ -298,6 +356,9 @@ export class FootnoteManager {
             const changes = transaction.mapping.filter((item) => item.from !== item.to)
                 .map((item) => `[^${item.from}] → [^${item.to}]`).join("；");
             confirm("统一脚注格式", `将整理 ${transaction.referenceCount} 处引用，更新 ${transaction.forward.length} 个块。`
+                + `<br>引用写法：${options.format === "text" ? "文本标记 [^编号]" : options.format === "keep" ? "保留写法" : "静态块引"}`
+                + (options.format !== "text" ? `；块引编号：${options.blockLabel === "brackets" ? "[编号]" : "[^编号]"}` : "")
+                + (options.superscript ? "；引用使用原生上标" : "；保留已有行内样式")
                 + (options.definitionFormat ? `<br>脚注定义：${options.definitionFormat === "list" ? "文末有序列表" : "[^编号]: 内容"}` : "")
                 + (changes ? `<br>${escapeHTML(changes)}` : "") + "<br><br>可通过一次撤销恢复。", () => {
                 void this.applyNormalization(editor, rootId, signature, options, transaction, allocated);
@@ -368,7 +429,7 @@ export class FootnoteManager {
     }
 
     async insert(editor: Protyle, block: HTMLElement) {
-        if (this.busy || this.disposed) return;
+        if (this.busy || this.disposed || this.insertionDialog) return;
         if (this.isSidebar(editor.protyle)) {this.error(new Error("请在正文中插入脚注")); return;}
         this.captureMain();
         const selection = window.getSelection();
@@ -378,69 +439,218 @@ export class FootnoteManager {
             || block.closest('[data-type="NodeBlockQueryEmbed"]') || ["NodeParagraph", "NodeHeading"].indexOf(block.dataset.type) < 0) {
             this.error(new Error("请在正文段落或标题中使用斜杠菜单插入脚注")); return;
         }
-        const before = range.cloneRange();
-        before.selectNodeContents(editable);
+        const before = range.cloneRange(); before.selectNodeContents(editable);
         before.setEnd(range.startContainer, range.startOffset);
         const start = before.toString().length, command = range.toString();
         if (!/^[\/、]/.test(command)) {this.error(new Error("无法获取斜杠命令选区，请重新执行")); return;}
-        const sourceHTML = block.outerHTML, rootId = editor.protyle.block.rootID, blockId = block.dataset.nodeId;
-        this.setBusy(true);
-        try {
-            this.assertWritable(editor);
-            await this.flush(editor);
-            const revision = this.revision;
-            const snapshot = await this.read(editor);
-            this.assertWritable(editor);
-            if (revision !== this.revision || editor.protyle.block.rootID !== rootId || !block.isConnected
-                || block.outerHTML !== sourceHTML || !range.startContainer.isConnected) throw new Error("正文或插入位置已改变，请重新执行");
-            const current = window.getSelection();
-            if (!current?.rangeCount || current.getRangeAt(0).startContainer !== range.startContainer
-                || current.getRangeAt(0).startOffset !== range.startOffset || current.getRangeAt(0).endContainer !== range.endContainer
-                || current.getRangeAt(0).endOffset !== range.endOffset) throw new Error("光标位置已改变，请重新执行");
-            // Lute is exposed on window; the siyuan module's type declarations
-            // do not guarantee a matching runtime export (including v3.8.7).
-            const lute = window.Lute;
-            if (typeof lute?.NewNodeID !== "function") throw new Error("思源块 ID 生成器尚未就绪，请重启思源后重试");
-            const transaction = prepareInsertion(snapshot, blockId, start, start + command.length, command, () => lute.NewNodeID());
-            const bookmark = {startContainer: range.startContainer, startOffset: range.startOffset,
-                endContainer: range.endContainer, endOffset: range.endOffset};
-            const local = applyInsertionToEditor(editor.protyle.wysiwyg.element, transaction, blockId, transaction.definitionId);
-            try {
-                // Match the host's editing contract: the active copy is already
-                // updated, and the transaction persists it and updates other copies.
-                const caret = document.createRange();
-                caret.setStartAfter(local.reference);
-                caret.collapse(true);
-                const selection = window.getSelection();
-                selection.removeAllRanges();
-                selection.addRange(caret);
-                editor.protyle.toolbar.range = caret;
-                editor.transaction(transaction.forward, transaction.undo);
-                // The next native edit must use the inserted marker as its undo
-                // baseline rather than the previous slash command text.
-                if (editor.protyle.wysiwyg.lastHTMLs) {
-                    editor.protyle.wysiwyg.lastHTMLs[blockId] = transaction.forward
-                        .find((operation) => operation.action === "update" && operation.id === blockId).data;
-                }
-            } catch (error) {
-                local.rollback();
-                const restored = document.createRange();
-                restored.setStart(bookmark.startContainer, bookmark.startOffset);
-                restored.setEnd(bookmark.endContainer, bookmark.endOffset);
-                const selection = window.getSelection();
-                selection.removeAllRanges();
-                selection.addRange(restored);
-                editor.protyle.toolbar.range = restored;
-                throw error;
+        const rootId = editor.protyle.block.rootID, blockId = block.dataset.nodeId;
+        const sourceSignature = documentContentSignature(block.outerHTML);
+        try {this.assertWritable(editor);} catch (error) {this.error(error); return;}
+        const pickerId = `footnote-picker-${++pickerSequence}`;
+        let pickerRows: IncrementalList<DocumentSnapshot["notes"][number]>;
+        const dialog = new Dialog({title: "插入脚注", width: "460px",
+            content: `<div class="siyuan-footnote-picker">
+                <input type="text" class="b3-text-field siyuan-footnote-picker__search" data-picker-search role="combobox" aria-label="搜索脚注" aria-autocomplete="list" aria-expanded="true" aria-controls="${pickerId}-notes" aria-describedby="${pickerId}-hint" placeholder="输入编号或内容，搜索已有脚注" autocomplete="off" spellcheck="false">
+                <div id="${pickerId}-hint" class="siyuan-footnote-picker__hint">↑ ↓ 选择 · Enter 前往确认 · Esc 取消</div>
+                <div data-picker-status role="status" aria-live="polite">正在读取脚注…</div>
+                <div id="${pickerId}-notes" data-picker-notes role="listbox" aria-label="已有脚注"></div>
+                <button type="button" class="siyuan-footnote-picker__create" data-picker-create aria-pressed="false" disabled>＋ 新建一条脚注</button>
+                <div data-picker-draft hidden><label class="siyuan-footnote-picker__draft"><span>新脚注内容（可选）</span><textarea class="b3-text-field" data-picker-content aria-label="新脚注内容" rows="3" placeholder="填写新脚注内容，编号自动分配"></textarea></label>
+                <div class="siyuan-footnote-picker__hint">编号自动分配，留空可在侧栏补充。</div></div>
+                <div class="siyuan-footnote-picker__actions"><button class="b3-button" data-picker-submit disabled>插入脚注</button>
+                <button class="b3-button b3-button--cancel" data-picker-cancel>取消</button></div></div>`,
+            destroyCallback: () => {
+                pickerRows?.destroy();
+                if (this.insertionDialog === dialog) this.insertionDialog = undefined;
+            },
+        });
+        this.insertionDialog = dialog;
+        const status = dialog.element.querySelector<HTMLElement>("[data-picker-status]");
+        const notes = dialog.element.querySelector<HTMLElement>("[data-picker-notes]");
+        const search = dialog.element.querySelector<HTMLInputElement>("[data-picker-search]");
+        const content = dialog.element.querySelector<HTMLTextAreaElement>("[data-picker-content]");
+        const submitButton = dialog.element.querySelector<HTMLButtonElement>("[data-picker-submit]");
+        const createButton = dialog.element.querySelector<HTMLButtonElement>("[data-picker-create]");
+        const draft = dialog.element.querySelector<HTMLElement>("[data-picker-draft]");
+        let available: DocumentSnapshot["notes"] = [];
+        let matches: DocumentSnapshot["notes"] = [], choices: DocumentSnapshot["notes"] = [];
+        const optionId = (note: DocumentSnapshot["notes"][number]) => `${pickerId}-option-${encodeURIComponent(note.key)}`;
+        let active = -1, ready = false, composing = false, creating = false;
+        const updateAction = () => {
+            submitButton.textContent = creating ? "新建脚注" : "插入脚注";
+            submitButton.disabled = !ready || this.busy || (!creating && !choices[active]);
+            createButton.disabled = !ready || this.busy;
+            createButton.setAttribute("aria-pressed", String(creating));
+            draft.hidden = !creating;
+            content.disabled = !creating || this.busy;
+        };
+        const activate = (index: number, scroll = false) => {
+            active = index;
+            creating = !choices[index];
+            const selected = choices[index];
+            if (selected) {
+                // Keyboard navigation can select a candidate outside the rendered batch.
+                const rendered = Array.from(notes.querySelectorAll<HTMLElement>("[data-picker-key]"))
+                    .some((button) => button.dataset.pickerKey === selected.key);
+                if (scroll || !rendered) pickerRows.reveal(selected.key);
+                search.setAttribute("aria-activedescendant", optionId(selected));
+            } else search.removeAttribute("aria-activedescendant");
+            for (const button of Array.from(notes.querySelectorAll<HTMLElement>("[data-picker-key]"))) {
+                button.setAttribute("aria-selected", String(button.dataset.pickerKey === selected?.key));
             }
-            local.reference.classList.add("siyuan-footnote-native-ref");
-            this.pendingSelection = {rootId, blockId: transaction.definitionId};
-            this.host.changed(rootId);
-            this.open();
-            this.schedule(1000);
-            showMessage(`已提交脚注 [^${transaction.label}]，可在侧栏编辑内容`);
-        } catch (error) {this.error(error);}
-        finally {this.setBusy(false);}
+            updateAction();
+        };
+        createButton.addEventListener("click", () => {activate(-1); content.focus();});
+        const cancel = () => {
+            dialog.destroy();
+            // Restore the slash selection only if it still belongs to this editor.
+            if (block.isConnected && editor.protyle.block.rootID === rootId
+                && documentContentSignature(block.outerHTML) === sourceSignature && range.startContainer.isConnected) {
+                const current = window.getSelection(); current.removeAllRanges(); current.addRange(range);
+                editor.protyle.toolbar.range = range;
+            }
+        };
+        dialog.element.querySelector("[data-picker-cancel]").addEventListener("click", cancel);
+        search.focus();
+        const readForInsertion = async () => {
+            const snapshot = await this.read(editor, true);
+            this.assertWritable(editor);
+            const source = Array.from(editor.protyle.wysiwyg.element.querySelectorAll<HTMLElement>("[data-node-id]"))
+                .find((node) => node.dataset.nodeId === blockId && !node.closest('[data-type="NodeBlockQueryEmbed"]'));
+            if (editor.protyle.block.rootID !== rootId || !source
+                || documentContentSignature(source.outerHTML) !== sourceSignature) throw new Error("正文或插入位置已改变，请重新执行");
+            // A freshly created paragraph can still be queued in the native editor.
+            // Its native creation precedes this transaction; do not wait for unrelated saves.
+            if (!snapshot.blocks.some((node) => node.dataset.nodeId === blockId)) {
+                const clone = source.cloneNode(true) as HTMLElement;
+                snapshot.container.append(clone); snapshot.blocks.push(clone);
+            }
+            return snapshot;
+        };
+        const submit = async () => {
+            const existingId = creating ? undefined : choices[active]?.blockId;
+            if (!ready || (!creating && !existingId) || this.busy || this.insertionDialog !== dialog) return;
+            this.setBusy(true);
+            pickerRows.suspend();
+            search.disabled = true;
+            content.disabled = true;
+            for (const button of Array.from(dialog.element.querySelectorAll<HTMLButtonElement>("button"))) button.disabled = true;
+            try {
+                const snapshot = await readForInsertion();
+                if (this.insertionDialog !== dialog || this.disposed) return;
+                const preferences = this.host.preferences?.() || DEFAULT_PREFERENCES;
+                const transaction = prepareInsertion(snapshot, blockId, start, start + command.length, command, () => {
+                    if (typeof window.Lute?.NewNodeID !== "function") throw new Error("思源块 ID 生成器尚未就绪，请重启思源后重试");
+                    return window.Lute.NewNodeID();
+                }, {preferences, existingId, content: content.value});
+                const bookmark = {startContainer: range.startContainer, startOffset: range.startOffset,
+                    endContainer: range.endContainer, endOffset: range.endOffset};
+                const local = applyInsertionToEditor(editor.protyle.wysiwyg.element, transaction, blockId, transaction.definitionId);
+                try {
+                    const caret = document.createRange(); caret.setStartAfter(local.reference); caret.collapse(true);
+                    const current = window.getSelection(); current.removeAllRanges(); current.addRange(caret);
+                    editor.protyle.toolbar.range = caret;
+                    editor.transaction(transaction.forward, transaction.undo);
+                    if (editor.protyle.wysiwyg.lastHTMLs) editor.protyle.wysiwyg.lastHTMLs[blockId] = transaction.forward
+                        .find((operation) => operation.action === "update" && operation.id === blockId).data;
+                } catch (error) {
+                    local.rollback();
+                    if (bookmark.startContainer.isConnected && bookmark.endContainer.isConnected) {
+                        const restored = document.createRange(); restored.setStart(bookmark.startContainer, bookmark.startOffset);
+                        restored.setEnd(bookmark.endContainer, bookmark.endOffset);
+                        const current = window.getSelection(); current.removeAllRanges(); current.addRange(restored);
+                        editor.protyle.toolbar.range = restored;
+                    }
+                    throw error;
+                }
+                this.pendingSelection = {rootId, blockId: transaction.definitionId, focus: transaction.created};
+                this.sidebar?.showPanel("notes");
+                this.host.changed(rootId); dialog.destroy(); this.open(); this.schedule(1000);
+                showMessage(`已提交脚注 [^${transaction.label}]，可在侧栏编辑内容`);
+            } catch (error) {
+                this.error(error);
+                if (this.insertionDialog === dialog) {
+                    search.disabled = false;
+                    content.disabled = false;
+                    status.textContent = error instanceof Error ? error.message : "插入失败，请重试";
+                    for (const button of Array.from(dialog.element.querySelectorAll<HTMLButtonElement>("button"))) {
+                        button.disabled = button.dataset.unavailable === "true";
+                    }
+                }
+            } finally {
+                this.setBusy(false);
+                if (this.insertionDialog === dialog) {updateAction(); pickerRows.resume();}
+            }
+        };
+        submitButton.addEventListener("click", () => void submit());
+        pickerRows = new IncrementalList(notes, notes, 40, (note) => note.key,
+            (note) => JSON.stringify([note.label, note.content.slice(0, 100), note.missing, note.duplicate]),
+            (note) => {
+                const button = document.createElement("button"); button.type = "button";
+                button.id = optionId(note); button.dataset.pickerKey = note.key;
+                button.setAttribute("role", "option");
+                button.setAttribute("aria-selected", String(choices[active]?.key === note.key)); button.tabIndex = -1;
+                button.className = "b3-button b3-button--outline siyuan-footnote-picker__note";
+                const number = document.createElement("strong"); number.className = "siyuan-footnote-picker__number";
+                number.textContent = `[^${note.label}]`;
+                const excerpt = document.createElement("span"); excerpt.className = "siyuan-footnote-picker__excerpt";
+                excerpt.textContent = note.content.slice(0, 100) || "暂无内容";
+                button.append(number, document.createTextNode("  "), excerpt);
+                button.disabled = !note.blockId || note.duplicate || note.missing;
+                button.dataset.unavailable = String(button.disabled); button.dataset.definitionId = note.blockId || "";
+                button.setAttribute("aria-disabled", String(button.disabled));
+                if (button.disabled) {
+                    button.title = note.duplicate ? "编号重复，请先处理" : "缺失定义，请先处理";
+                    const warning = document.createElement("small"); warning.className = "siyuan-footnote-picker__warning";
+                    warning.textContent = note.duplicate ? "编号重复" : "缺失定义"; button.append(warning);
+                } else {
+                    button.addEventListener("click", () => activate(choices.indexOf(note)));
+                }
+                return button;
+            }, "脚注候选");
+        const filter = () => {
+            if (!ready || this.busy) return;
+            const query = search.value.trim().toLocaleLowerCase();
+            const label = query.match(/^\[\^?([^\]\s:]+)\]$/)?.[1] || query;
+            const tokens = label.split(/\s+/).filter(Boolean);
+            matches = available.filter((note) => tokens.every((token) =>
+                `${note.label}\n${note.content}`.toLocaleLowerCase().includes(token)));
+            // Exact numbers come first even when the same text appears in other notes.
+            matches.sort((a, b) => Number(b.label.toLocaleLowerCase() === label) - Number(a.label.toLocaleLowerCase() === label));
+            choices = matches.filter((note) => note.blockId && !note.duplicate && !note.missing);
+            active = -1;
+            pickerRows.setItems(matches, true);
+            activate(choices.length ? 0 : -1);
+            status.textContent = !available.length ? "当前文档没有脚注，可新建脚注。"
+                : !matches.length ? "没有匹配的脚注，可修改搜索或新建脚注。"
+                : `${query ? `找到 ${matches.length} 条匹配脚注` : `共 ${available.length} 条脚注`}，选择已有脚注或新建。`;
+        };
+        search.addEventListener("compositionstart", () => {composing = true;});
+        search.addEventListener("compositionend", () => {composing = false; filter();});
+        search.addEventListener("input", () => {if (!composing) filter();});
+        dialog.element.addEventListener("keydown", (event: KeyboardEvent) => {
+            if (event.isComposing || event.keyCode === 229 || composing || this.busy) return;
+            if (event.key === "Escape") {event.preventDefault(); event.stopPropagation(); cancel(); return;}
+            if (event.target !== search || !ready) return;
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                if (choices.length) {
+                    const next = active < 0 ? (event.key === "ArrowDown" ? 0 : choices.length - 1)
+                        : (active + (event.key === "ArrowDown" ? 1 : -1) + choices.length) % choices.length;
+                    activate(next, true);
+                }
+            } else if (event.key === "Enter") {
+                event.preventDefault();
+                if (!submitButton.disabled) submitButton.focus();
+            }
+        });
+        try {
+            const snapshot = await readForInsertion();
+            if (this.insertionDialog !== dialog || this.disposed) return;
+            available = snapshot.notes; ready = true; filter();
+        } catch (error) {
+            if (this.insertionDialog === dialog) status.textContent = error instanceof Error ? error.message : "读取脚注失败，请重新打开";
+        }
     }
 
     open() {
@@ -501,6 +711,8 @@ export class FootnoteManager {
 
     destroy() {
         this.disposed = true;
+        this.insertionDialog?.destroy();
+        this.insertionDialog = undefined;
         this.request++;
         window.clearTimeout(this.timer);
         this.visibility?.disconnect();

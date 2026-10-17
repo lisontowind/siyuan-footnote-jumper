@@ -1,8 +1,9 @@
 import {confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Menu, openMobileFileById, openTab, Plugin, showMessage} from "siyuan";
 import {DefinitionCandidate, indexDefinitions, parseDefinition, readDocumentDefinitions, readOrderedDefinitions, StoredDefinition} from "./definitions";
 import {FootnoteManager} from "./manager";
+import {DEFAULT_PREFERENCES, FootnotePreferences} from "./document";
 import {flushDocumentEdits, TABLE_SAVE_MESSAGE} from "./editing";
-import {readMarkers, replaceTextRun, visitInline, wrapTextRun} from "./inline";
+import {isSuperscript, markerIsSuperscript, readMarkers, replaceTextRun, visitInline, wrapTextRun} from "./inline";
 import "./index.scss";
 
 const STORAGE_NAME = "footnote-jumper-settings";
@@ -25,6 +26,7 @@ const TABLE_EDIT_MESSAGE = TABLE_SAVE_MESSAGE;
 interface FootnoteSettings {
     enabled: boolean;
     liveRefreshEditingBlock: boolean;
+    preferences?: FootnotePreferences;
 }
 
 interface FootnoteDefinition extends StoredDefinition {
@@ -65,9 +67,12 @@ interface FootnoteOrigin {
 }
 
 export default class FootnoteJumperPlugin extends Plugin {
-    private enabled = true;
+    private enabled = false;
+    private jumpStyleEnabled = true;
+    private preferences: FootnotePreferences = {...DEFAULT_PREFERENCES};
+    private manualRefreshPending = false;
+    private manualRefreshEditor?: IProtyle;
     private liveRefreshEditingBlock = true;
-    private topBarElement?: HTMLElement;
     private observer?: MutationObserver;
     private refreshTimer = 0;
     private refreshTimerAt = 0;
@@ -226,6 +231,7 @@ export default class FootnoteJumperPlugin extends Plugin {
 
     private readonly handleCompositionEnd = () => {
         this.isComposing = false;
+        if (this.manualRefreshPending) void this.manualRefresh(this.manualRefreshEditor);
         const selectionBlock = this.getSelectionBlock();
         if (selectionBlock) {
             this.activateBlock(selectionBlock);
@@ -371,7 +377,13 @@ export default class FootnoteJumperPlugin extends Plugin {
             </symbol>
         `);
         this.footnoteManager = new FootnoteManager(this, {
-            jumpEnabled: () => this.enabled,
+            jumpEnabled: () => this.jumpStyleEnabled,
+            preferences: () => this.preferences,
+            setPreferences: (preferences) => this.setPreferences(preferences),
+            liveRefresh: () => this.liveRefreshEditingBlock,
+            setLiveRefresh: (enabled) => this.setLiveRefreshEditingBlock(enabled),
+            manualRefresh: (editor) => this.manualRefresh(editor.protyle),
+            checkDuplicates: (anchor, editor) => void this.checkDuplicateDefinitions(anchor, editor?.protyle),
             setJumpEnabled: (enabled) => this.setEnabled(enabled),
             navigate: async (blockId) => {
                 for (const editor of getAllEditor()) {
@@ -401,13 +413,6 @@ export default class FootnoteJumperPlugin extends Plugin {
 
     async onLayoutReady() {
         await this.loadSettings();
-        this.topBarElement = this.addTopBar({
-            icon: "iconFootnoteJumper",
-            title: "脚注跳转",
-            position: "right",
-            callback: (event) => this.openTopBarMenu(event),
-        });
-        this.updateTopBarState();
 
         for (const editor of getAllEditor()) {
             this.registerEditor(editor?.protyle);
@@ -480,7 +485,17 @@ export default class FootnoteJumperPlugin extends Plugin {
         try {
             const settings = await this.loadData(STORAGE_NAME) as FootnoteSettings;
             if (typeof settings?.enabled === "boolean") {
-                this.enabled = settings.enabled;
+                this.jumpStyleEnabled = settings.enabled;
+            }
+            const preferences = settings?.preferences;
+            if (preferences) {
+                for (const name of ["format", "definitionFormat", "blockLabel"] as const) {
+                    const allowed = {format: ["block", "text"], definitionFormat: ["list", "literal"], blockLabel: ["caret", "brackets"]};
+                    if (allowed[name].indexOf(preferences[name]) >= 0) (this.preferences as Record<string, unknown>)[name] = preferences[name];
+                }
+                for (const name of ["renumber", "superscript"] as const) {
+                    if (typeof preferences[name] === "boolean") this.preferences[name] = preferences[name];
+                }
             }
             if (typeof settings?.liveRefreshEditingBlock === "boolean") {
                 this.liveRefreshEditingBlock = settings.liveRefreshEditingBlock;
@@ -488,82 +503,40 @@ export default class FootnoteJumperPlugin extends Plugin {
         } catch (error) {
             console.warn(`[${this.name}] load settings failed`, error);
         }
-        this.footnoteManager?.updateJumpStyle(this.enabled);
+        this.applyEnabled(this.preferences.format === "text" && this.jumpStyleEnabled);
+        this.footnoteManager?.updateJumpStyle(this.jumpStyleEnabled);
+        this.footnoteManager?.updatePreferences();
     }
 
     private saveSettings() {
         const settings: FootnoteSettings = {
-            enabled: this.enabled,
+            enabled: this.jumpStyleEnabled,
             liveRefreshEditingBlock: this.liveRefreshEditingBlock,
+            preferences: {...this.preferences},
         };
         this.saveData(STORAGE_NAME, settings).catch((error) => {
             console.warn(`[${this.name}] save settings failed`, error);
         });
     }
 
-    private openTopBarMenu(event: MouseEvent) {
-        event.preventDefault();
-        event.stopPropagation();
-
-        const menu = new Menu("siyuan-footnote-jumper-menu");
-        menu.addItem({
-            label: "打开脚注侧栏",
-            icon: "iconFootnoteJumper",
-            click: () => this.footnoteManager?.open(),
-        });
-        menu.addSeparator();
-        menu.addItem({
-            label: "脚注跳转",
-            icon: "iconFootnoteJumper",
-            checked: this.enabled,
-            click: () => {
-                this.setEnabled(!this.enabled);
-            },
-        });
-        menu.addItem({
-            label: "编辑块实时刷新",
-            icon: "iconRefresh",
-            checked: this.liveRefreshEditingBlock,
-            click: () => {
-                this.setLiveRefreshEditingBlock(!this.liveRefreshEditingBlock);
-            },
-        });
-        menu.addSeparator();
-        menu.addItem({
-            label: "检查重复脚注编号",
-            icon: "iconSearch",
-            click: () => { void this.checkDuplicateDefinitions(); },
-        });
-        menu.addItem({
-            label: "为脚注标记添加块引",
-            icon: "iconLink",
-            disabled: this.isAddingNativeBlockRefs,
-            click: () => {
-                this.confirmAddNativeBlockRefs();
-            },
-        });
-        menu.addItem({
-            label: "转换脚注定义格式",
-            icon: "iconFootnoteJumper",
-            click: () => this.footnoteManager?.open(),
-        });
-
-        const rect = this.topBarElement?.getBoundingClientRect();
-        menu.open({
-            x: rect ? rect.left : event.clientX,
-            y: rect ? rect.bottom : event.clientY,
-        });
+    private setPreferences(preferences: FootnotePreferences) {
+        this.preferences = {...preferences};
+        this.applyEnabled(preferences.format === "text" && this.jumpStyleEnabled);
+        this.saveSettings(); this.footnoteManager?.updatePreferences();
     }
 
     private setEnabled(enabled: boolean) {
+        this.jumpStyleEnabled = enabled;
+        this.applyEnabled(this.preferences.format === "text" && enabled);
+        this.footnoteManager?.updateJumpStyle(enabled); this.saveSettings();
+    }
+
+    private applyEnabled(enabled: boolean) {
         if (this.enabled === enabled) {
             return;
         }
 
         this.enabled = enabled;
-        this.footnoteManager?.updateJumpStyle(enabled);
-        this.updateTopBarState();
-        this.saveSettings();
 
         if (this.enabled) {
             this.documentDefinitions.clear();
@@ -572,7 +545,6 @@ export default class FootnoteJumperPlugin extends Plugin {
             this.activeBlockId = this.activeBlock?.dataset.nodeId;
             this.markAllBlocksDirty();
             this.scheduleRefresh(50);
-            showMessage("脚注跳转已开启");
         } else {
             window.clearTimeout(this.refreshTimer);
             this.refreshTimer = 0;
@@ -585,7 +557,6 @@ export default class FootnoteJumperPlugin extends Plugin {
             this.hideTooltip();
             this.clearReturnOrigin();
             this.cleanupEnhancements();
-            showMessage("脚注跳转已关闭");
         }
     }
 
@@ -596,6 +567,7 @@ export default class FootnoteJumperPlugin extends Plugin {
 
         this.liveRefreshEditingBlock = enabled;
         this.saveSettings();
+        this.footnoteManager?.updatePreferences();
 
         if (!this.activeBlock
             || !Array.from(this.dirtyBlocks).some((block) => block.isConnected && this.isActiveBlock(block))) {
@@ -781,19 +753,8 @@ export default class FootnoteJumperPlugin extends Plugin {
         reference.dataset.type = NATIVE_BLOCK_REF_TYPE;
         reference.dataset.subtype = "s";
         reference.dataset.id = definitionBlockId;
-        reference.textContent = `[${id}]`;
+        reference.textContent = `[^${id}]`;
         return reference;
-    }
-
-    private updateTopBarState() {
-        if (!this.topBarElement) {
-            return;
-        }
-
-        this.topBarElement.classList.toggle("siyuan-footnote-topbar--enabled", this.enabled);
-        this.topBarElement.setAttribute("aria-pressed", String(this.enabled));
-        this.topBarElement.setAttribute("aria-label", "脚注跳转");
-        this.topBarElement.removeAttribute("title");
     }
 
     private startObserving() {
@@ -1094,7 +1055,26 @@ export default class FootnoteJumperPlugin extends Plugin {
         }, safeDelay);
     }
 
-    private refresh() {
+    private async manualRefresh(managed?: IProtyle) {
+        if (!this.enabled || this.unloaded) return;
+        if (this.isComposing) {this.manualRefreshPending = true; this.manualRefreshEditor = managed; return;}
+        this.manualRefreshPending = false; this.manualRefreshEditor = undefined;
+        const editor = managed || getActiveEditor()?.protyle;
+        // Clicking the sidebar must not change the managed document.
+        const rootId = editor?.block?.rootID;
+        if (!rootId || editor.wysiwyg.element.closest("[data-footnote-sidebar]")) return;
+        this.invalidateDocumentDefinitions(rootId);
+        this.registerEditor(editor); this.markEditorDirty(editor.wysiwyg.element);
+        await this.ensureDocumentDefinitions(rootId);
+        if (!this.unloaded && this.enabled && getActiveEditor()?.protyle?.block?.rootID === rootId) {
+            if (this.isComposing) {this.manualRefreshPending = true; this.manualRefreshEditor = editor; return;}
+            const selectionBlock = this.getSelectionBlock();
+            if (selectionBlock?.closest(".protyle-wysiwyg") === editor.wysiwyg.element) this.activateBlock(selectionBlock);
+            this.refresh(true);
+        }
+    }
+
+    private refresh(forceActive = false) {
         if (!this.enabled || this.isComposing) {
             return;
         }
@@ -1165,7 +1145,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         const now = Date.now();
         const blocks = Array.from(this.dirtyBlocks).filter((block) => {
             return block.isConnected
-                && (!this.isActiveBlock(block)
+                && (forceActive || !this.isActiveBlock(block)
                     || (this.liveRefreshEditingBlock && now >= this.activeRefreshAt));
         });
         if (blocks.length === 0) {
@@ -1298,12 +1278,12 @@ export default class FootnoteJumperPlugin extends Plugin {
 
     private definitionPreview(definition?: FootnoteDefinition) {
         return definition?.candidates
-            ? `脚注编号 [^${definition.id}] 重复（${definition.candidates.length} 处）。点击标记可选择定义，或通过顶部菜单检查重复编号。`
+            ? `脚注编号 [^${definition.id}] 重复（${definition.candidates.length} 处）。点击标记可选择定义，或通过侧栏检查重复编号。`
             : definition?.content || "未找到对应脚注定义";
     }
 
-    private async checkDuplicateDefinitions() {
-        const editor = getActiveEditor()?.protyle;
+    private async checkDuplicateDefinitions(anchor?: HTMLElement, managed?: IProtyle) {
+        const editor = managed || getActiveEditor()?.protyle;
         const rootId = editor?.block?.rootID;
         if (!rootId || !editor.wysiwyg?.element) {
             showMessage("请先打开需要检查的文档", 3000, "error");
@@ -1312,14 +1292,15 @@ export default class FootnoteJumperPlugin extends Plugin {
         this.registerEditor(editor);
         try {
             const blocks = await this.readDocumentBlocks(rootId, editor.wysiwyg.element);
-            if (this.unloaded || getActiveEditor()?.protyle !== editor) return;
+            if (this.unloaded || !editor.wysiwyg.element.isConnected
+                || getActiveEditor()?.protyle?.block?.rootID !== rootId) return;
             const duplicates = Array.from(this.indexBlockDefinitions(blocks).values())
                 .filter((definition) => definition.candidates);
             if (!duplicates.length) {
                 showMessage("全文未发现重复脚注编号");
                 return;
             }
-            this.openDuplicateMenu(duplicates, this.topBarElement);
+            this.openDuplicateMenu(duplicates, anchor);
         } catch (error) {
             console.warn(`[${this.name}] check duplicates failed`, error);
             showMessage(error instanceof Error && error.message === TABLE_EDIT_MESSAGE
@@ -1358,6 +1339,9 @@ export default class FootnoteJumperPlugin extends Plugin {
                 const reference = document.createElement("span");
                 reference.className = definition?.candidates ? REF_CLASS + " " + CONFLICT_CLASS
                     : definition ? REF_CLASS : REF_CLASS + " " + MISSING_CLASS;
+                if (markerIsSuperscript(nodes, match.index, match.index + match[0].length)) {
+                    reference.classList.add("siyuan-footnote-ref--native-sup");
+                }
                 reference.dataset.footnoteId = match[1];
                 reference.dataset.preview = this.definitionPreview(definition);
                 reference.setAttribute(ENHANCED_ATTR, "true");
@@ -1450,7 +1434,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         for (const native of Array.from(block.querySelectorAll<HTMLElement>('[data-type~="block-ref"]'))) {
             if (native.closest("[data-node-id]") !== block
                 || native.closest('[data-type="NodeBlockQueryEmbed"], [data-type~="code"], code, pre')) continue;
-            if (targetIds.has(native.dataset.id)) native.classList.add(NATIVE_REF_CLASS);
+            if (targetIds.has(native.dataset.id) && !isSuperscript(native)) native.classList.add(NATIVE_REF_CLASS);
         }
     }
 

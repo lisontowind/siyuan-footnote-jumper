@@ -95,10 +95,10 @@ function host(query = async () => []) {
     };
     const editing = loadSource("editing.ts", {siyuan: api, "./document": {}}, {document, window});
     const Plugin = loadSource("index.ts", {siyuan: api, "./definitions": definitions, "./inline": loadSource("inline.ts", {}), "./editing": editing,
-        "./manager": {FootnoteManager: class {}}, "./index.scss": {}}, {
+        "./document": {DEFAULT_PREFERENCES: {format: "text", definitionFormat: "literal", blockLabel: "caret", renumber: true, superscript: true}}, "./manager": {FootnoteManager: class {}}, "./index.scss": {}}, {
         window, document, Date: HostDate, Node: Element, HTMLElement: Element, NodeFilter: {SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2},
     }).default;
-    const plugin = new Plugin();
+    const plugin = new Plugin(); plugin.enabled = true;
     const addEditor = (rootID, blocks = []) => {
         const element = new Element();
         element.isEditor = true;
@@ -257,7 +257,7 @@ test("native reference conversion also accepts definitions that are not loaded",
     assert.equal(h.plugin.convertFootnoteMarkersToNativeRefs(block, h.plugin.collectDefinitions(editor.element)), 1);
     const reference = block.querySelector('[data-type="block-ref"]');
     assert.equal(reference.dataset.id, "tail");
-    assert.equal(reference.textContent, "[1]");
+    assert.equal(reference.textContent, "[^1]");
 });
 
 test("exact page boundaries and non-definition candidates do not lose footnotes", async () => {

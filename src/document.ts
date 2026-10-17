@@ -1,6 +1,6 @@
 import type {IOperation} from "siyuan";
 import {parseDefinition, readOrderedDefinitions} from "./definitions";
-import {replaceTextRun, visitInline} from "./inline";
+import {isSuperscript, markerIsSuperscript, replaceTextRun, visitInline, wrapTextRun} from "./inline";
 export {replaceTextRun} from "./inline";
 
 export const NATIVE_REF_CLASS = "siyuan-footnote-native-ref";
@@ -50,9 +50,40 @@ export interface NormalizationOptions {
     format: "block" | "text" | "keep";
     renumber: boolean;
     definitionFormat?: "literal" | "list";
+    blockLabel?: "brackets" | "caret";
+    superscript?: boolean;
+}
+
+export type FootnotePreferences = Omit<Required<NormalizationOptions>, "format"> & {format: "block" | "text"};
+export const DEFAULT_PREFERENCES: FootnotePreferences = {
+    format: "block", definitionFormat: "list", blockLabel: "caret", renumber: true, superscript: true,
+};
+
+/** A read-only audit of the cleaned, complete index. */
+export function auditFootnoteFormat(snapshot: DocumentSnapshot, options: FootnotePreferences): string[] {
+    if (snapshot.pending || !snapshot.notes.length) return [];
+    const issues: string[] = [];
+    if (snapshot.references.some((ref) => ref.kind !== options.format
+        || ref.native && ref.native.dataset.subtype !== "s")) issues.push("引用写法");
+    if (snapshot.notes.some((note) => note.blockId)
+        && snapshot.definitionFormat !== (options.format === "text" ? "literal" : options.definitionFormat)) issues.push("定义格式");
+    if (options.format === "block" && snapshot.references.some((ref) => ref.kind === "block"
+        && ref.native?.textContent !== (options.blockLabel === "brackets" ? `[${ref.label}]` : `[^${ref.label}]`))) issues.push("块引编号");
+    if (options.superscript && snapshot.references.some((ref) => ref.native ? !isSuperscript(ref.native)
+        : !markerIsSuperscript(ref.run || [], ref.start, ref.end))) issues.push("引用上标");
+    if (options.renumber && snapshot.notes.some((note, index) => note.label !== String(index + 1))) issues.push("连续编号");
+    if (snapshot.staleReferenceCount && issues.indexOf("块引编号") < 0) issues.push("引用编号");
+    return issues;
+}
+
+export interface InsertionOptions {
+    preferences?: FootnotePreferences;
+    existingId?: string;
+    content?: string;
 }
 
 export interface FootnoteTransaction {
+    insertionIndex?: number;
     forward: IOperation[];
     undo: IOperation[];
     mapping: {from: string; to: string; blockId: string}[];
@@ -84,7 +115,8 @@ export function documentContentSignature(dom: string | DocumentFragment) {
         const template = document.createElement("template");
         template.innerHTML = dom;
         root = template.content;
-    } else root = dom;
+    } else root = dom.cloneNode(true) as DocumentFragment;
+    cleanFootnoteDOM(root);
     const ignored = new Set(["updated", "data-node-index", "data-render", "contenteditable", "spellcheck"]);
     const visit = (node: Node): unknown => {
         if (node.nodeType === 3) return node.textContent;
@@ -98,7 +130,7 @@ export function documentContentSignature(dom: string | DocumentFragment) {
                     .filter((name) => name && [NATIVE_REF_CLASS, "siyuan-footnote-definition",
                         "siyuan-footnote-definition--highlight", "protyle-wysiwyg--select"].indexOf(name) < 0).sort().join(" ");
                 return [attribute.name, value];
-            }).filter(([name, value]) => name !== "class" || value)
+            }).filter(([name, value]) => name !== "class" && name !== "style" || value.trim())
             .sort((a, b) => a[0].localeCompare(b[0]));
         return [element.tagName, attributes, Array.from(element.childNodes, visit).filter((child) => child !== undefined)];
     };
@@ -275,8 +307,81 @@ export function createNativeReference(label: string, targetId: string) {
     ref.dataset.type = "block-ref";
     ref.dataset.subtype = "s";
     ref.dataset.id = targetId;
-    ref.textContent = `[${label}]`;
+    ref.textContent = `[^${label}]`;
     return ref;
+}
+
+// SiYuan persists inline styles as tokens on the same span as block-ref.
+// Nesting a reference inside a styled span loses its target when Lute saves it.
+function collectReferenceStyles(source: HTMLElement, target: HTMLElement) {
+    const tags: Record<string, string> = {B: "strong", STRONG: "strong", I: "em", EM: "em",
+        S: "s", STRIKE: "s", DEL: "s", U: "u", MARK: "mark", SUP: "sup", SUB: "sub", KBD: "kbd"};
+    const tokens = new Set((target.dataset.type || "").split(/\s+/).filter(Boolean));
+    for (const node of [source, ...Array.from(source.querySelectorAll<HTMLElement>("*"))]) {
+        if (tags[node.tagName]) tokens.add(tags[node.tagName]);
+        for (const token of (node.dataset.type || "").split(/\s+/)) {
+            if (token && token !== "block-ref" && token !== "a") tokens.add(token);
+        }
+        for (const name of Array.from(node.style)) target.style.setProperty(name, node.style.getPropertyValue(name),
+            typeof node.style.getPropertyPriority === "function" ? node.style.getPropertyPriority(name) : "");
+        for (const name of Array.from(node.classList)) target.classList.add(name);
+    }
+    if (tokens.size) target.dataset.type = Array.from(tokens).join(" ");
+}
+
+function replaceReference(ref: FootnoteReference, kind: "text" | "block", label: string, targetId: string,
+    options: NormalizationOptions) {
+    // Number-only changes retain each character's formatting in text markers.
+    if (!ref.native && kind === "text" && !options.superscript) {
+        if (label !== ref.label) replaceTextRun(ref.run, ref.start + 2, ref.end - 1, document.createTextNode(label));
+        return;
+    }
+    const source = document.createElement("span");
+    const nodes = ref.native ? textNodes(ref.native) : ref.run;
+    const start = ref.native ? 0 : ref.start;
+    const end = ref.native ? ref.native.textContent.length : ref.end;
+    const boundary = nodes.find((node) => node.data.length)?.parentElement.closest<HTMLElement>('td, th, [contenteditable="true"]')
+        || nodes[0]?.parentElement.closest<HTMLElement>("[data-node-id]");
+    // Isolate the whole marker from surrounding styled text before flattening.
+    if (ref.native && !end) {
+        source.append(ref.native.cloneNode(true));
+        ref.native.replaceWith(source);
+    } else wrapTextRun(nodes, start, end, source, boundary);
+    const replacement = kind === "block" ? createNativeReference(label, targetId) : document.createElement("span");
+    if (ref.native) {
+        for (const attr of Array.from(ref.native.attributes)) replacement.setAttribute(attr.name, attr.value);
+        if (kind === "text") {
+            const tokens = (replacement.dataset.type || "").split(/\s+/).filter((token) => token && token !== "block-ref");
+            if (tokens.length) replacement.dataset.type = tokens.join(" ");
+            else replacement.removeAttribute("data-type");
+            for (const name of ["data-id", "data-subtype", "data-anchor", "data-text"]) replacement.removeAttribute(name);
+        }
+    }
+    collectReferenceStyles(source, replacement);
+    const tokens = new Set((replacement.dataset.type || "").split(/\s+/).filter(Boolean));
+    if (options.superscript) {tokens.delete("sub"); tokens.add("sup"); replacement.style.removeProperty("vertical-align");}
+    if (tokens.size) replacement.dataset.type = Array.from(tokens).join(" ");
+    if (kind === "block") {
+        replacement.dataset.id = targetId;
+        replacement.dataset.subtype = "s";
+    }
+    replacement.textContent = kind === "block" && options.blockLabel === "brackets" ? `[${label}]` : `[^${label}]`;
+    if (!replacement.getAttribute("style")) replacement.removeAttribute("style");
+    // Stable attribute order keeps a second normalization a no-op, including
+    // native-to-text conversions that remove reference-only attributes.
+    const attrs = Array.from(replacement.attributes).map(({name, value}) => ({name, value})).sort((a, b) => a.name.localeCompare(b.name));
+    for (const {name} of attrs) replacement.removeAttribute(name);
+    for (const {name, value} of attrs) replacement.setAttribute(name, value);
+    source.replaceWith(kind === "text" && !replacement.attributes.length ? document.createTextNode(replacement.textContent) : replacement);
+}
+
+export function resolveNormalizationOptions(snapshot: DocumentSnapshot, options: NormalizationOptions): NormalizationOptions {
+    // Text references identify definitions by a fixed label, while ordered-list
+    // labels change when native list items move. Keep those definitions literal.
+    const hasText = options.format === "text"
+        || options.format === "keep" && snapshot.references.some((ref) => ref.kind === "text");
+    return hasText && (options.definitionFormat === "list" || snapshot.definitionFormat === "list")
+        ? {...options, definitionFormat: "literal"} : options;
 }
 
 export function prepareNormalization(snapshot: DocumentSnapshot, options: NormalizationOptions,
@@ -285,6 +390,7 @@ export function prepareNormalization(snapshot: DocumentSnapshot, options: Normal
     if (snapshot.notes.some((note) => note.duplicate || note.missing)) {
         throw new Error("存在重复编号或缺失定义，请先在侧栏定位并处理");
     }
+    options = resolveNormalizationOptions(snapshot, options);
     const before = new Map(snapshot.blocks.map((block) => [block.dataset.nodeId, block.outerHTML]));
     const labels = new Map<string, string>();
     const byLabel = new Map<string, IndexedFootnote>();
@@ -302,17 +408,9 @@ export function prepareNormalization(snapshot: DocumentSnapshot, options: Normal
         const note = ref.kind === "block" ? byBlock.get(ref.definitionId || ref.targetId) : byLabel.get(ref.label);
         const label = labels.get(note.blockId);
         const kind = options.format === "keep" ? ref.kind : options.format;
-        const replacement = kind === "block" ? createNativeReference(label, note.blockId)
-            : document.createTextNode(`[^${label}]`);
-        if (ref.native) {
-            if (kind === "block") {
-                // Unwrapping a terminal list removes its item IDs. Point native
-                // refs at the preserved paragraph before those items disappear.
-                if (!ref.native.dataset.id || options.definitionFormat === "literal" && note.listId) ref.native.dataset.id = note.blockId;
-                ref.native.dataset.subtype = "s";
-                ref.native.textContent = `[${label}]`;
-            } else ref.native.replaceWith(replacement);
-        } else replaceTextRun(ref.run, ref.start, ref.end, replacement);
+        const targetId = ref.native?.dataset.id && !(options.definitionFormat === "literal" && note.listId)
+            ? ref.native.dataset.id : note.blockId;
+        replaceReference(ref, kind, label, targetId, options);
     }
     for (const block of snapshot.blocks) {
         const note = byBlock.get(block.dataset.nodeId);
@@ -488,6 +586,41 @@ function writeReferencesLast(operations: IOperation[], desired: DocumentFragment
         .concat(references.map((block) => ({action: "update", id: block.dataset.nodeId, data: block.outerHTML})));
 }
 
+/** Merge only new native blocks for insertion numbering/anchors, retaining unloaded siblings.
+ * Existing containers are never replaced by a potentially virtualized copy. */
+export function includeQueuedBlocks(kernelDOM: string, editors: HTMLElement[]) {
+    const template = document.createElement("template"); template.innerHTML = kernelDOM;
+    const nodes = new Map(Array.from(template.content.querySelectorAll<HTMLElement>("[data-node-id]"))
+        .map((node) => [node.dataset.nodeId, node]));
+    for (const editor of editors) {
+        if (editor.closest("[data-footnote-sidebar]")) continue;
+        for (const live of Array.from(editor.querySelectorAll<HTMLElement>("[data-node-id]"))) {
+            if (nodes.has(live.dataset.nodeId) || live.closest('[data-type="NodeBlockQueryEmbed"]')) continue;
+            const parentId = live.parentElement?.closest<HTMLElement>("[data-node-id]")?.dataset.nodeId;
+            const parent = parentId ? nodes.get(parentId) : template.content;
+            if (!parent) continue;
+            const clone = live.cloneNode(true) as HTMLElement;
+            // Known descendants may be undergoing a move into this new container.
+            // Keep their complete kernel copies rather than duplicating IDs or truncating them.
+            for (const child of Array.from(clone.querySelectorAll<HTMLElement>("[data-node-id]"))) {
+                if (nodes.has(child.dataset.nodeId)) child.remove();
+            }
+            // Descendants of a new container travel with that native creation.
+            let previous = live.previousElementSibling as HTMLElement;
+            while (previous && !nodes.has(previous.dataset.nodeId)) previous = previous.previousElementSibling as HTMLElement;
+            let next = live.nextElementSibling as HTMLElement;
+            while (next && !nodes.has(next.dataset.nodeId)) next = next.nextElementSibling as HTMLElement;
+            if (previous && nodes.get(previous.dataset.nodeId).parentNode === parent) nodes.get(previous.dataset.nodeId).after(clone);
+            else if (next && nodes.get(next.dataset.nodeId).parentNode === parent) nodes.get(next.dataset.nodeId).before(clone);
+            else parent.append(clone);
+            nodes.set(clone.dataset.nodeId, clone);
+            for (const child of Array.from(clone.querySelectorAll<HTMLElement>("[data-node-id]"))) nodes.set(child.dataset.nodeId, child);
+        }
+    }
+    cleanFootnoteDOM(template.content);
+    return Array.from(template.content.childNodes).map((node) => node.nodeType === 1 ? (node as HTMLElement).outerHTML : node.textContent).join("");
+}
+
 export function nextFootnoteLabel(snapshot: DocumentSnapshot) {
     const used = new Set([...snapshot.notes.map((note) => note.label), ...snapshot.references.map((ref) => ref.label)]);
     let value = 1;
@@ -496,8 +629,7 @@ export function nextFootnoteLabel(snapshot: DocumentSnapshot) {
 }
 
 export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, start: number, end: number,
-    command: string, newId: () => string): FootnoteTransaction & {definitionId: string; label: string} {
-    if (snapshot.pending) throw new Error("文档仍有待保存的块，请等待保存后重试");
+    command: string, newId: () => string, options: InsertionOptions = {}): FootnoteTransaction & {definitionId: string; label: string; created: boolean} {
     const source = snapshot.blocks.find((block) => block.dataset.nodeId === sourceId);
     if (!source || source.dataset.type === "NodeTable" || snapshot.notes.some((note) => note.blockId === sourceId) || definition(source)) {
         throw new Error("请在正文段落或标题中插入脚注");
@@ -511,17 +643,27 @@ export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, s
     if (nodes.map((node) => node.data).join("").slice(start, end) !== command) {
         throw new Error("正文或插入位置已改变，请重新执行斜杠菜单");
     }
+    const existing = options.existingId && snapshot.notes.find((note) => note.blockId === options.existingId);
+    if (options.existingId && (!existing || existing.duplicate || existing.missing)) throw new Error("目标脚注已改变，请重新选择");
     const ordered = snapshot.notes.filter((note) => note.listId);
-    const label = ordered.length ? String(Math.max(...ordered.map((note) => Number(note.label))) + 1) : nextFootnoteLabel(snapshot);
-    if (ordered.length && snapshot.notes.some((note) => note.missing && note.label === label)) {
+    const label = existing ? existing.label : ordered.length ? String(Math.max(...ordered.map((note) => Number(note.label))) + 1) : nextFootnoteLabel(snapshot);
+    if (!existing && ordered.length && snapshot.notes.some((note) => note.missing && note.label === label)) {
         throw new Error("下一个列表序号已有缺失引用，请先修复后再插入");
     }
-    const definitionId = newId();
+    const definitionId = existing ? existing.blockId : newId();
+    const content = options.content?.trim() || "";
     const oldHTML = source.outerHTML;
-    replaceTextRun(nodes, start, end, createNativeReference(label, definitionId));
+    const preferences = options.preferences;
+    const marker = preferences?.format === "text" ? document.createElement("span") : createNativeReference(label, definitionId);
+    marker.textContent = preferences?.format === "block" && preferences.blockLabel === "brackets" ? `[${label}]` : `[^${label}]`;
+    if (preferences?.superscript) marker.dataset.type = [marker.dataset.type, "sup"].filter(Boolean).join(" ");
+    // Locate the exact inserted marker, even when this target is already referenced in the same block.
+    replaceTextRun(nodes, start, end, marker);
+    const insertionIndex = Array.from(source.querySelectorAll("span")).indexOf(marker);
     const referenceUpdate: IOperation = {action: "update", id: sourceId, data: source.outerHTML};
     const forward: IOperation[] = [];
     const undo: IOperation[] = [{action: "update", id: sourceId, data: oldHTML}];
+    if (existing) return {forward: [referenceUpdate], undo, mapping: [], referenceCount: 1, insertionIndex, label, definitionId, created: false};
     const makeBlock = (id: string, heading: boolean, text: string) => {
         const block = document.createElement("div");
         block.dataset.nodeId = id;
@@ -543,9 +685,8 @@ export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, s
     if (ordered.length) {
         const last = ordered.slice().sort((a, b) => Number(b.label) - Number(a.label))[0];
         const list = tail.find((block) => block.dataset.nodeId === last.listId);
-        const oldList = list.outerHTML;
         const template = document.createElement("template");
-        template.innerHTML = makeBlock(definitionId, false, "");
+        template.innerHTML = makeBlock(definitionId, false, content);
         const block = template.content.firstElementChild as HTMLElement;
         block.setAttribute("custom-footnote-label", label);
         const item = document.createElement("div");
@@ -553,10 +694,10 @@ export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, s
         item.dataset.subtype = "o"; item.dataset.marker = `${label}.`; item.className = "li";
         const action = document.createElement("div"); action.className = "protyle-action";
         action.setAttribute("draggable", "true"); action.textContent = `${label}.`;
-        item.append(action, block); list.append(item);
-        forward.push({action: "update", id: list.dataset.nodeId, data: list.outerHTML});
-        undo.unshift({action: "update", id: list.dataset.nodeId, data: oldList});
-        return {forward: [...forward, referenceUpdate], undo, mapping: [], referenceCount: 1, label, definitionId};
+        item.append(action, block);
+        forward.push({action: "insert", id: item.dataset.nodeId, data: item.outerHTML, parentID: list.dataset.nodeId, previousID: last.itemId});
+        undo.unshift({action: "delete", id: item.dataset.nodeId});
+        return {forward: [...forward, referenceUpdate], undo, mapping: [], referenceCount: 1, insertionIndex, label, definitionId, created: true};
     }
     // Reuse only a terminal top-level h2 section: no later h1/h2 ends it.
     let section = -1;
@@ -575,8 +716,20 @@ export function prepareInsertion(snapshot: DocumentSnapshot, sourceId: string, s
         const headingId = newId();
         insert(headingId, makeBlock(headingId, true, "脚注"));
     }
-    insert(definitionId, makeBlock(definitionId, false, `[^${label}]: `));
-    return {forward: [...forward, referenceUpdate], undo, mapping: [], referenceCount: 1, label, definitionId};
+    if (!snapshot.notes.some((note) => note.blockId) && preferences?.format === "block" && preferences.definitionFormat === "list") {
+        const list = document.createElement("div");
+        list.dataset.nodeId = newId(); list.dataset.type = "NodeList"; list.dataset.subtype = "o"; list.className = "list";
+        const item = document.createElement("div");
+        item.dataset.nodeId = newId(); item.dataset.type = "NodeListItem"; item.dataset.subtype = "o";
+        item.dataset.marker = `${label}.`; item.className = "li";
+        const action = document.createElement("div"); action.className = "protyle-action";
+        action.setAttribute("draggable", "true"); action.textContent = `${label}.`;
+        item.append(action);
+        item.insertAdjacentHTML("beforeend", makeBlock(definitionId, false, content));
+        item.querySelector("[data-node-id]").setAttribute("custom-footnote-label", label);
+        list.append(item); insert(list.dataset.nodeId, list.outerHTML);
+    } else insert(definitionId, makeBlock(definitionId, false, `[^${label}]: ${content}`));
+    return {forward: [...forward, referenceUpdate], undo, mapping: [], referenceCount: 1, insertionIndex, label, definitionId, created: true};
 }
 
 /** Apply normalization to loaded blocks before submitting the host transaction.
@@ -656,8 +809,9 @@ export function applyInsertionToEditor(root: HTMLElement, transaction: FootnoteT
     const update = transaction.forward.find((operation) => operation.action === "update" && operation.id === sourceId);
     if (!source?.isConnected || typeof update?.data !== "string") throw new Error("正文或插入位置已改变，请重新执行");
     const replacement = parse(update.data, sourceId);
-    const reference = Array.from(replacement.querySelectorAll<HTMLElement>('[data-type~="block-ref"]'))
-        .find((ref) => ref.dataset.id === definitionId);
+    const reference = (transaction.insertionIndex === undefined ? undefined : replacement.querySelectorAll<HTMLElement>("span")[transaction.insertionIndex])
+        || Array.from(replacement.querySelectorAll<HTMLElement>('[data-type~="block-ref"]'))
+            .find((ref) => ref.dataset.id === definitionId);
     if (!reference) throw new Error("脚注事务缺少正文标识，请重新插入");
     // Parse everything first so validation cannot leave a half-written editor.
     const inserts = transaction.forward.filter((operation) => operation.action === "insert")
@@ -676,8 +830,10 @@ export function applyInsertionToEditor(root: HTMLElement, transaction: FootnoteT
         for (const {operation, element} of inserts) {
             if (find(operation.id)) continue;
             const previous = operation.previousID && find(operation.previousID);
-            if (!previous) continue;
-            previous.after(element);
+            const parent = find(operation.parentID);
+            if (previous) previous.after(element);
+            else if (!operation.previousID && parent) parent.append(element);
+            else continue;
             inserted.push(element);
         }
     } catch (error) {rollback(); throw error;}

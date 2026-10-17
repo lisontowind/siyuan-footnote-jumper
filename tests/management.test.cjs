@@ -52,7 +52,13 @@ function host() {
         focusBlock() {this.focused = true;}
     }
     // Lute is a window global in the real host, not a require("siyuan") export.
+    const dialogs = [];
     const api = {Protyle,
+        Dialog: class {
+            constructor(options) {this.options = options; this.element = document.createElement("div");
+                this.element.innerHTML = options.content; document.body.append(this.element); dialogs.push(this);}
+            destroy() {this.element.remove(); this.options.destroyCallback?.();}
+        },
         getActiveEditor: () => active, getAllEditor: () => editors, getFrontend: () => "desktop",
         showMessage: (text) => messages.push(text), confirm: (title, text, cb) => confirmations.push({title, text, cb}),
         fetchSyncPost: async (url) => {
@@ -82,13 +88,17 @@ function host() {
         return editor;
     };
     const opens = [], changes = [];
-    let jumpEnabled = true;
+    let jumpEnabled = true, liveRefresh = true, preferences = {...model.DEFAULT_PREFERENCES};
     const manager = new managerModule.FootnoteManager(plugin, {
         jumpEnabled: () => jumpEnabled,
+        preferences: () => preferences,
+        setPreferences: (value) => {preferences = {...value}; manager.updatePreferences();},
+        liveRefresh: () => liveRefresh,
+        setLiveRefresh: (value) => {liveRefresh = value; manager.updatePreferences();},
         setJumpEnabled: (enabled) => {jumpEnabled = enabled; manager.updateJumpStyle(enabled);},
         navigate: async (id) => opens.push(id), tablePending: () => false, changed: (id) => changes.push(id)});
     return {document, model, manager, plugin, api, hostWindow, nativeEditors, messages, confirmations, editing,
-        transactions, timers, addEditor, opens, changes, sidebarModule, editors,
+        transactions, timers, addEditor, opens, changes, sidebarModule, editors, dialogs,
         snapshot: (html, overlays = [], ignored) => model.buildDocumentSnapshot("doc", html, overlays, ignored),
         setDOM: (html) => {dom = html;}, setActive: (editor) => {active = editor;},
         deferRead: () => {let resolve; pendingRead = new Promise((r) => {resolve = r;}); return (html) => {
@@ -174,7 +184,7 @@ test("multiple split markers in one formatted run normalize without offset corru
     const tx = h.model.prepareNormalization(s, {format: "block", renumber: true});
     const result = h.snapshot(tx.forward.map(op => op.data).join(""));
     assert.deepEqual(Array.from(result.references, r => r.targetId), ["a", "b", "a"]);
-    assert.equal(result.references[0].excerpt, "[1] / [2] / [1]");
+    assert.equal(result.references[0].excerpt, "[^1] / [^2] / [^1]");
 });
 
 test("text conversion and keep mode retain native target identity and ordinary refs", () => {
@@ -231,13 +241,13 @@ test("insertion reuses only a terminal top-level footnote section", () => {
     assert.equal(next.forward[0].previousID, "end");
 });
 
-test("pending new blocks and changed insertion text stop all writes", () => {
+test("pending new blocks only stop normalization; changed insertion text still stops insertion", () => {
     const h = host();
     const editor = h.addEditor("doc", block("new-block", "待保存"));
     const s = h.snapshot(block("body", "/jz"), [editor.protyle.wysiwyg.element]);
     assert.equal(s.pending, true);
     assert.throws(() => h.model.prepareNormalization(s, {format: "block", renumber: true}), /待保存/);
-    assert.throws(() => h.model.prepareInsertion(s, "body", 0, 3, "/jz", () => "id"), /待保存/);
+    assert.equal(h.model.prepareInsertion(s, "body", 0, 3, "/jz", () => "id").referenceCount, 1);
     assert.throws(() => h.model.prepareInsertion(h.snapshot(block("body", "changed")), "body", 0, 3, "/jz", () => "id"), /已改变/);
 });
 
@@ -385,7 +395,7 @@ test("confirmation tolerates a focus change between equivalent main and sidebar 
     focused = editor.protyle.wysiwyg.element.querySelector('[contenteditable="true"]');
     h.confirmations[0].cb(); await new Promise(resolve => setImmediate(resolve));
     assert.equal(h.transactions.length, 1, h.messages.at(-1));
-    assert.match(h.transactions[0].forward.at(-1).data, /\[1\]/);
+    assert.match(h.transactions[0].forward.at(-1).data, /\[\^1\]/);
 });
 
 test("content comparison ignores renderer metadata but detects rich text, targets, properties and hierarchy changes", () => {
@@ -572,15 +582,19 @@ test("slash insertion uses global Lute without a module export and leaves no wri
             toString() {return text.data.slice(this.startOffset, this.endOffset);}};
         h.setSelection({rangeCount: 1, range, getRangeAt() {return this.range;},
             removeAllRanges() {this.rangeCount = 0;}, addRange(range) {this.range = range; this.rangeCount = 1;}});
+        // Choose creation in the dialog; opening it itself must never write.
         await h.manager.insert(editor, source);
+        assert.equal(h.transactions.length, 0);
+        confirmNewFootnote(h);
+        for (let tick = 0; tick < 12; tick++) await Promise.resolve();
         if (available) {
             assert.equal(h.transactions.length, 1);
             const {forward, undo} = h.transactions[0];
             assert.equal(forward.length, 3);
             assert.equal(undo.length, 3);
             assert.match(forward[2].data, /data-id="new-1"/);
-            assert.match(forward[1].data, /\[\^1\]: /);
-            assert.match(editor.protyle.wysiwyg.lastHTMLs.body, /\[1\]/);
+            assert.match(forward[1].data, /data-type="NodeList"/);
+            assert.match(editor.protyle.wysiwyg.lastHTMLs.body, /\[\^1\]/);
         } else {
             assert.equal(h.transactions.length, 0);
             assert.match(h.messages.at(-1), /生成器尚未就绪/);
@@ -601,7 +615,7 @@ test("local insertion displays the active marker and terminal section; rollback 
         let id = 0; return () => `new-${++id}`;
     })());
     const local = h.model.applyInsertionToEditor(root, tx, "body", tx.definitionId);
-    assert.equal(local.reference.textContent, "[1]");
+    assert.equal(local.reference.textContent, "[^1]");
     assert.equal(root.children.length, 3);
     assert.equal(root.querySelectorAll('[data-id="new-1"]').length, 1);
     assert.doesNotMatch(root.textContent, /\/jz/);
@@ -696,7 +710,7 @@ test("literal definitions convert to a terminal list with rich content, stable t
     assert.equal(replay(h, literal, reverse.undo), next);
 });
 
-test("reordered list labels warn and refresh text and native references without changing targets", () => {
+test("refreshing legacy mixed references migrates list definitions to fixed labels without changing targets", () => {
     const h = host();
     const html = block("body", `[^1] ${ref("a", "[^1]")} [^2]`)
         + orderedList("tail", [["b", "B", "2"], ["a", "A", "1"]]);
@@ -706,12 +720,13 @@ test("reordered list labels warn and refresh text and native references without 
     const tx = h.model.prepareNormalization(s, {format: "keep", renumber: false, definitionFormat: "list"});
     const next = replay(h, h.snapshot(html).signature, tx.forward);
     assert.equal(h.snapshot(next).staleReferenceCount, 0);
-    assert.match(next, /\[\^2\].*data-id="a".*\[2\].*\[\^1\]/);
-    assert.deepEqual(Array.from(h.snapshot(next).topLevel.at(-1).querySelectorAll('[data-type="NodeParagraph"]'), n => n.dataset.nodeId), ["b", "a"]);
+    assert.match(next, /\[\^2\].*data-id="a".*\[\^2\].*\[\^1\]/);
+    assert.equal(h.snapshot(next).definitionFormat, "literal");
+    assert.deepEqual(Array.from(h.snapshot(next).topLevel.slice(-2), n => n.dataset.nodeId), ["b", "a"]);
     assert.equal(replay(h, next, tx.undo), h.snapshot(html).signature);
     h.manager.register(); const panel = h.mount();
     h.manager.sidebar.render(h.snapshot(html), "文档");
-    assert.match(panel.querySelector('[role="status"]').textContent, /序号已变化，请刷新序号/);
+    assert.match(panel.querySelector('.siyuan-footnote-sidebar__status').textContent, /序号已变化，请刷新序号/);
     assert.equal(panel.querySelector('[data-action="refresh-numbers"]').hidden, false);
 });
 
@@ -721,7 +736,7 @@ test("list-mode insertion appends a list item and local rollback restores both e
     let id = 0;
     const tx = h.model.prepareInsertion(h.snapshot(html), "body", 0, 3, "/jz", () => `new-${++id}`);
     assert.equal(tx.label, "4");
-    assert.deepEqual(Array.from(tx.forward, op => [op.action, op.id]), [["update", "tail"], ["update", "body"]]);
+    assert.deepEqual(Array.from(tx.forward, op => [op.action, op.id]), [["insert", "new-2"], ["update", "body"]]);
     const next = replay(h, h.snapshot(html).signature, tx.forward);
     assert.equal(h.snapshot(next).notes.length, 2);
     assert.doesNotMatch(next, /\[\^4\]:/);
@@ -760,7 +775,7 @@ test("normalization updates the loaded editor before submission and rolls back a
         } else {
             assert.equal(h.transactions.length, 1);
             assert.equal(root.innerHTML, replay(h, original, h.transactions[0].forward));
-            assert.match(editor.protyle.wysiwyg.lastHTMLs.body, /\[1\]/);
+            assert.match(editor.protyle.wysiwyg.lastHTMLs.body, /\[\^1\]/);
         }
     }
 });
@@ -860,7 +875,8 @@ test("unsaved list metadata and parent changes block writes without truncating p
         const snapshot = h.snapshot(html, [editor.protyle.wysiwyg.element]);
         assert.equal(snapshot.pending, true);
         assert.throws(() => h.model.prepareNormalization(snapshot, {format: "keep", renumber: false}), /待保存/);
-        assert.throws(() => h.model.prepareInsertion(snapshot, "body", 0, 3, "/jz", () => "new"), /待保存/);
+        const insertion = h.model.prepareInsertion(snapshot, "body", 0, 3, "/jz", () => "new");
+        assert.equal(insertion.forward.some(op => op.action === "update" && op.id === "tail"), false);
     }
     editor.protyle.wysiwyg.element.innerHTML = orderedList("tail", [["b", "B"]], 2);
     const partial = h.snapshot(html, [editor.protyle.wysiwyg.element]);
@@ -1002,9 +1018,10 @@ test("numeric native footnotes participate in text, block and keep normalization
         const s = h.snapshot(next);
         assert.deepEqual(Array.from(s.notes, n => [n.blockId, n.references.length]), [["b", 1], ["a", 2]]);
         assert.equal(s.notes.some(n => n.missing), false);
+        assert.equal(s.definitionFormat, format === "text" ? "literal" : definitionFormat);
         if (format === "text") assert.equal(s.references.every(r => r.kind === "text"), true);
         else {
-            assert.deepEqual(Array.from(s.references, r => r.native.textContent), ["[1]", "[2]", "[2]"]);
+            assert.deepEqual(Array.from(s.references, r => r.native.textContent), ["[^1]", "[^2]", "[^2]"]);
             assert.deepEqual(Array.from(s.references, r => r.targetId), definitionFormat === "literal"
                 ? ["b", "a", "a"] : ["li-b", "a", "li-a"]);
         }
@@ -1032,7 +1049,7 @@ test("static refs use plain brackets while text markers and literal definitions 
     const h = host();
     const html = block("body", `正文 [^12] ${ref("d", "[^12]")} 普通文字 [12]`)
         + block("d", "[^12]: <b>内容</b>");
-    const options = {format: "block", renumber: false};
+    const options = {format: "block", renumber: false, blockLabel: "brackets"};
     const tx = h.model.prepareNormalization(h.snapshot(html), options);
     const native = replay(h, h.snapshot(html).signature, tx.forward);
     const s = h.snapshot(native);
@@ -1048,4 +1065,771 @@ test("static refs use plain brackets while text markers and literal definitions 
     assert.equal(h.snapshot(text).references.length, 2);
     assert.match(text, /正文 \[\^12\] \[\^12\] 普通文字 \[12\]/);
     assert.equal(replay(h, text, textTx.undo), native);
+});
+
+test("styled references support both static labels and native superscript across every format with exact undo", () => {
+    const h = host();
+    const html = block("body", '<span data-type="strong" style="color: red">前 [^<i>12</i>] 后</span> '
+        + '<span data-type="block-ref em" data-id="d" data-subtype="d" style="background-color: yellow">[12]</span>')
+        + block("table", '<table><tr><td><span data-type="u">[^12]</span></td><td>普通 [12]</td></tr></table>', "NodeTable")
+        + block("d", "[^12]: <b>定义</b>");
+    for (const format of ["block", "text", "keep"]) for (const blockLabel of ["caret", "brackets"])
+        for (const definitionFormat of ["literal", "list"]) {
+            const options = {format, blockLabel, definitionFormat, renumber: true, superscript: true};
+            let id = 0;
+            const tx = h.model.prepareNormalization(h.snapshot(html), options, () => `new-${++id}`);
+            const next = replay(h, h.snapshot(html).signature, tx.forward);
+            const snapshot = h.snapshot(next);
+            assert.equal(snapshot.definitionFormat, format === "block" ? definitionFormat : "literal");
+            assert.equal(snapshot.references.length, 3);
+            assert.equal(snapshot.notes.some(n => n.missing), false);
+            for (const r of snapshot.references) {
+                const element = r.native || r.run.find(n => n.data.includes("[^1]")).parentElement;
+                assert.equal(element.matches('[data-type~="sup"]'), true);
+                if (r.kind === "block") {
+                    assert.equal(element.textContent, blockLabel === "caret" ? "[^1]" : "[1]");
+                    assert.equal(element.dataset.id, "d");
+                    assert.equal(element.parentElement.matches('td, th, [contenteditable="true"]'), true);
+                } else assert.equal(element.hasAttribute("data-id"), false);
+            }
+            const body = snapshot.blocks.find(b => b.dataset.nodeId === "body");
+            const first = body.querySelector('[data-type~="sup"]');
+            assert.equal(first.matches('[data-type~="strong"][data-type~="em"]'), true);
+            assert.equal(first.style.color, "red");
+            assert.equal(body.firstElementChild.firstElementChild.textContent, "前 ");
+            assert.match(next, /普通 \[12\]/);
+            assert.match(next, /<b>定义<\/b>/);
+            const again = h.model.prepareNormalization(h.snapshot(next), options, () => {throw Error("must reuse IDs");});
+            assert.equal(again.forward.length, 0, JSON.stringify({options, next, again}));
+            assert.equal(replay(h, next, tx.undo), h.snapshot(html).signature);
+        }
+});
+
+test("native superscript and inline styles survive block-text-block conversions without duplicating size", () => {
+    const h = host();
+    const html = block("body", '<span data-type="block-ref sup strong text" data-id="d" data-subtype="s" style="color: red">[^10]</span>')
+        + block("d", "[^10]: 内容");
+    const textTx = h.model.prepareNormalization(h.snapshot(html), {format: "text", renumber: false});
+    const text = replay(h, h.snapshot(html).signature, textTx.forward);
+    assert.doesNotMatch(text, /block-ref|data-id=/);
+    assert.match(text, /data-type="sup strong text"/);
+    const tx = h.model.prepareNormalization(h.snapshot(text), {format: "block", renumber: false, superscript: true, blockLabel: "brackets"});
+    const next = replay(h, text, tx.forward);
+    const r = h.snapshot(next).references[0];
+    assert.equal(r.targetId, "d");
+    assert.equal(r.native.matches('[data-type~="sup"][data-type~="strong"]'), true);
+    assert.equal(r.native.querySelector("span"), null);
+    assert.equal(r.native.style.color, "red");
+    assert.equal(r.native.textContent, "[10]");
+});
+
+test("sidebar offers block and text formats with dependent fields and independent superscript controls", () => {
+    const h = host(); h.manager.register();
+    const panel = h.mount(), values = [];
+    h.manager.normalize = options => values.push(options);
+    assert.equal(panel.querySelector('[data-block-label]').querySelector('option').value, "caret");
+    assert.equal(panel.querySelector('[data-superscript]').hasAttribute("checked"), true);
+    panel.querySelector('[data-block-label] option[value="brackets"]').selected = true;
+    panel.querySelector('[data-superscript]').checked = true;
+    panel.querySelector('[data-renumber]').checked = false;
+    assert.equal(panel.querySelector('select option[value="keep"]'), null);
+    panel.querySelector('[data-definition-format] option[value="list"]').selected = true;
+    for (const format of ["block", "text", "block"]) {
+        panel.querySelector(`select option[value="${format}"]`).selected = true;
+        panel.querySelector('select').dispatchEvent(new h.document.defaultView.Event("change"));
+        assert.equal(panel.querySelector('[data-block-label]').disabled, format === "text");
+        assert.equal(panel.querySelector('[data-definition-format] option[value="list"]').disabled, format === "text");
+        assert.equal(panel.querySelector('[data-definition-format-field]').hidden, format === "text");
+        assert.equal(panel.querySelector('[data-block-label-field]').hidden, format === "text");
+        assert.equal(panel.querySelector('[data-text-format-hint]').hidden, format !== "text");
+        panel.querySelector('[data-action="normalize"]').dispatchEvent(new h.document.defaultView.Event("click"));
+        assert.equal(values.at(-1).format, format);
+        assert.equal(values.at(-1).blockLabel, "brackets");
+        assert.equal(values.at(-1).superscript, true);
+        assert.equal(values.at(-1).renumber, false);
+        assert.equal(values.at(-1).definitionFormat, format === "text" ? "literal" : "list");
+    }
+});
+
+test("text and mixed keep normalization always use fixed definitions, including omitted layout and superscript", () => {
+    const h = host();
+    const html = block("body", `[^1] ${ref("li-b", "[2]")}`)
+        + orderedList("tail", [["b", "B", "2"], ["a", "<b>A</b>", "1"]]);
+    for (const format of ["text", "keep"]) for (const superscript of [false, true])
+        for (const definitionFormat of [undefined, "list", "literal"]) {
+            const options = {format, superscript, definitionFormat, renumber: false};
+            const tx = h.model.prepareNormalization(h.snapshot(html), options);
+            const next = replay(h, h.snapshot(html).signature, tx.forward);
+            const snapshot = h.snapshot(next);
+            assert.equal(snapshot.definitionFormat, "literal");
+            assert.equal(snapshot.staleReferenceCount, 0);
+            assert.equal(snapshot.references.length, 2);
+            assert.equal(snapshot.notes.find(n => n.blockId === "a").references[0].label, "2");
+            assert.equal(snapshot.notes.find(n => n.blockId === "b").references[0].label, "1");
+            assert.match(next, /\[\^2\]: <b>A<\/b>/);
+            assert.equal(snapshot.references[1].kind, format === "keep" ? "block" : "text");
+            if (format === "keep") assert.equal(snapshot.references[1].targetId, "b");
+            assert.equal(h.model.prepareNormalization(h.snapshot(next), options).forward.length, 0);
+            assert.equal(replay(h, next, tx.undo), h.snapshot(html).signature);
+        }
+});
+
+test("legacy mixed-reference refresh confirmation uses fixed definitions and preserves targets", async () => {
+    const h = host(); h.manager.register(); const panel = h.mount();
+    const html = block("body", `[^1] ${ref("b", "[2]")}`)
+        + orderedList("tail", [["a", "A"], ["b", "B"]]);
+    const editor = h.addEditor("doc", html); h.setDOM(html);
+    h.manager.sidebar.render(h.snapshot(html), "文档");
+    h.manager.sidebar.invalidateEditor();
+    await h.manager.normalize({format: "keep", renumber: false, definitionFormat: "list"});
+    assert.match(h.confirmations[0].text, /脚注定义：\[\^编号\]: 内容/);
+    assert.doesNotMatch(h.confirmations[0].text, /脚注定义：文末有序列表/);
+    h.confirmations[0].cb();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.transactions.length, 1);
+    assert.equal(h.snapshot(editor.protyle.wysiwyg.element.innerHTML).definitionFormat, "literal");
+});
+
+
+function slashContext(h, editor, start = 3, end = 6) {
+    const source = editor.protyle.wysiwyg.element.firstElementChild;
+    const text = source.querySelector('[contenteditable="true"]').firstChild;
+    h.document.createRange = () => ({
+        setStart(node, offset) {this.startContainer = node; this.startOffset = offset;},
+        setEnd(node, offset) {this.endContainer = node; this.endOffset = offset;},
+        setStartAfter(node) {this.setStart(node.parentNode, Array.from(node.parentNode.childNodes).indexOf(node) + 1);},
+        collapse() {this.endContainer = this.startContainer; this.endOffset = this.startOffset;},
+    });
+    editor.protyle.toolbar = {}; editor.protyle.wysiwyg.lastHTMLs = {};
+    const range = {startContainer: text, startOffset: start, endContainer: text, endOffset: end,
+        cloneRange() {return {...this};}, selectNodeContents() {this.startOffset = 0; this.endOffset = text.data.length;},
+        setEnd(node, offset) {this.endContainer = node; this.endOffset = offset;},
+        toString() {return text.data.slice(this.startOffset, this.endOffset);}};
+    h.setSelection({rangeCount: 1, range, getRangeAt() {return this.range;},
+        removeAllRanges() {this.rangeCount = 0;}, addRange(value) {this.range = value; this.rangeCount = 1;}});
+    return source;
+}
+async function settle() {for (let tick = 0; tick < 25; tick++) await Promise.resolve();}
+function confirmNewFootnote(h) {
+    const dialog = h.dialogs.at(-1).element;
+    dialog.querySelector('[data-picker-create]').click();
+    dialog.querySelector('[data-picker-submit]').click();
+}
+
+async function openLargePicker(h, count = 1000) {
+    const html = block('body', '正文 /jz 后') + Array.from({length: count}, (_, i) =>
+        block(`picker-note-${i + 1}`, `[^${i + 1}]: 候选说明 ${i + 1}${i === count - 1 ? ' 搜索文末特殊内容' : ''}`)).join('');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+    await h.manager.insert(editor, slashContext(h, editor));
+    return h.dialogs.at(-1).element;
+}
+
+test('large picker loads 40 rows at a time while retaining selection, row identity and complete search', async () => {
+    const h = host(), dialog = await openLargePicker(h), list = dialog.querySelector('[data-picker-notes]');
+    assert.equal(list.querySelectorAll('[role="option"]').length, 40);
+    assert.match(dialog.querySelector('[data-picker-status]').textContent, /1000 条脚注/);
+    const first = list.querySelector('[data-definition-id="picker-note-1"]');
+    scrollListEdge(h, dialog, '脚注候选');
+    assert.equal(list.querySelectorAll('[role="option"]').length, 80);
+    assert.equal(list.querySelector('[data-definition-id="picker-note-1"]'), first);
+    assert.equal(first.getAttribute('aria-selected'), 'true');
+    list.querySelector('[data-definition-id="picker-note-75"]').click();
+    assert.equal(dialog.querySelector('[data-picker-submit]').textContent, '插入脚注');
+    scrollListEdge(h, dialog, '脚注候选');
+    assert.equal(list.querySelectorAll('[role="option"]').length, 120);
+    assert.equal(list.querySelector('[data-definition-id="picker-note-75"]').getAttribute('aria-selected'), 'true');
+    const search = dialog.querySelector('[data-picker-search]'); search.value = '搜索文末特殊内容';
+    search.dispatchEvent(new h.document.defaultView.Event('input'));
+    assert.equal(list.querySelectorAll('[role="option"]').length, 1);
+    assert.equal(list.querySelector('[role="option"]').dataset.definitionId, 'picker-note-1000');
+    assert.equal(list.scrollTop, 0);
+    assert.equal(dialog.querySelector('[data-list-edge="end"]').hidden, true);
+    assert.equal(h.transactions.length, 0);
+    search.value = ''; search.dispatchEvent(new h.document.defaultView.Event('input'));
+    assert.equal(list.querySelectorAll('[role="option"]').length, 40);
+    dialog.querySelector('[data-picker-cancel]').click();
+});
+
+test('picker keyboard navigation crosses batches and wraps to the last unloaded note before confirmation', async () => {
+    const h = host(), dialog = await openLargePicker(h), search = dialog.querySelector('[data-picker-search]');
+    const key = key => search.dispatchEvent(Object.assign(new h.document.defaultView.Event('keydown', {bubbles: true}), {key}));
+    for (let i = 0; i < 40; i++) key('ArrowDown');
+    assert.equal(dialog.querySelector('[aria-selected="true"]').dataset.definitionId, 'picker-note-41');
+    assert.equal(dialog.querySelectorAll('[role="option"]').length, 120);
+    key('ArrowUp');
+    assert.equal(dialog.querySelector('[aria-selected="true"]').dataset.definitionId, 'picker-note-40');
+    search.value = ''; search.dispatchEvent(new h.document.defaultView.Event('input'));
+    dialog.querySelector('[data-picker-create]').click();
+    key('ArrowUp');
+    const selected = dialog.querySelector('[aria-selected="true"]');
+    assert.equal(selected.dataset.definitionId, 'picker-note-1000');
+    assert.equal(search.getAttribute('aria-activedescendant'), selected.id);
+    assert.ok(dialog.querySelectorAll('[role="option"]').length <= 120);
+    assert.equal(h.transactions.length, 0);
+    dialog.querySelector('[data-picker-submit]').click(); await settle();
+    assert.equal(h.transactions.length, 1);
+    assert.equal(h.transactions[0].forward.length, 1);
+    assert.match(h.transactions[0].forward[0].data, /data-id="picker-note-1000"/);
+});
+
+test('picker disconnects scroll observers on close and ignores late observer callbacks', async () => {
+    const h = host(), observers = [];
+    h.hostWindow.IntersectionObserver = class {
+        constructor(callback) {this.callback = callback; this.targets = new Set(); observers.push(this);}
+        observe(target) {this.targets.add(target);}
+        disconnect() {this.disconnected = true;}
+    };
+    const dialog = await openLargePicker(h, 200), observer = observers[0];
+    const end = dialog.querySelector('[data-list-edge="end"]');
+    observer.callback([{isIntersecting: true, target: end}]);
+    assert.equal(dialog.querySelectorAll('[role="option"]').length, 80);
+    dialog.querySelector('[data-picker-cancel]').click();
+    assert.equal(observer.disconnected, true);
+    observer.callback([{isIntersecting: true, target: end}]);
+    assert.equal(dialog.querySelectorAll('[role="option"]').length, 80);
+    assert.equal(h.manager.insertionDialog, undefined);
+    assert.equal(h.transactions.length, 0);
+});
+
+test('picker searches complete content and wrapped labels, prioritizes exact labels and skips unavailable choices', async () => {
+    const h = host(), html = block('body', '正文 /jz 后')
+        + block('other', '[^17]: 包含 7 的说明') + block('exact', '[^7]: Exact match')
+        + block('long', '[^A]: ' + '较长的说明。'.repeat(30) + ' Hidden Keyword')
+        + block('dup1', '[^D]: 重复一') + block('dup2', '[^D]: 重复二');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+    await h.manager.insert(editor, slashContext(h, editor));
+    const dialog = h.dialogs.at(-1).element, input = dialog.querySelector('[data-picker-search]');
+    const search = value => {input.value = value; input.dispatchEvent(new h.document.defaultView.Event('input'));};
+    search('[^7]');
+    assert.equal(dialog.querySelector('[role="option"]').dataset.definitionId, 'exact');
+    assert.equal(input.getAttribute('aria-activedescendant'), dialog.querySelector('[data-definition-id="exact"]').id);
+    search('hidden keyword');
+    assert.equal(dialog.querySelectorAll('[role="option"]').length, 1);
+    assert.equal(dialog.querySelector('[role="option"]').dataset.definitionId, 'long');
+    search('D');
+    assert.equal(dialog.querySelector('[data-definition-id="dup1"]').disabled, true);
+    assert.match(dialog.querySelector('[data-definition-id="dup1"]').textContent, /编号重复/);
+    assert.notEqual(dialog.querySelector('[aria-selected="true"]')?.dataset.definitionId, 'dup1');
+    search('没有匹配');
+    assert.equal(dialog.querySelectorAll('[role="option"]').length, 0);
+    assert.equal(input.hasAttribute('aria-activedescendant'), false);
+    assert.equal(dialog.querySelector('[data-picker-submit]').disabled, false);
+    assert.match(dialog.querySelector('[data-picker-status]').textContent, /没有匹配/);
+    assert.equal(h.transactions.length, 0);
+});
+
+test('picker keyboard reuse respects IME and creates no extra definition or content edits', async () => {
+    const h = host(), html = block('body', '正文 /jz 后') + block('a', '[^1]: One') + block('b', '[^2]: Two');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+    await h.manager.insert(editor, slashContext(h, editor));
+    const dialog = h.dialogs.at(-1).element, input = dialog.querySelector('[data-picker-search]');
+    const key = (key, extra = {}) => input.dispatchEvent(Object.assign(new h.document.defaultView.Event('keydown', {bubbles: true}), {key, ...extra}));
+    dialog.querySelector('[data-picker-content]').value = '不能覆盖已有脚注';
+    key('Enter', {isComposing: true}); await settle(); assert.equal(h.transactions.length, 0);
+    key('ArrowDown');
+    assert.equal(dialog.querySelector('[aria-selected="true"]').dataset.definitionId, 'b');
+    key('Enter'); await settle();
+    assert.equal(h.transactions.length, 0);
+    assert.equal(dialog.querySelector('[data-picker-submit]').textContent, '插入脚注');
+    dialog.querySelector('[data-picker-submit]').click(); await settle();
+    assert.equal(h.transactions.length, 1);
+    assert.equal(h.transactions[0].forward.length, 1);
+    assert.match(h.transactions[0].forward[0].data, /data-id="b"/);
+    assert.doesNotMatch(h.transactions[0].forward[0].data, /不能覆盖/);
+});
+
+test('new footnote content stays plain text across literal, initial list and appended list insertions with exact undo', () => {
+    const h = host(), content = '<img src=x onerror=alert(1)> & 说明\n第二行';
+    for (const mode of ['literal', 'initial-list', 'append-list']) {
+        const tail = mode === 'literal' ? block('old', '[^4]: 已有说明') : mode === 'append-list'
+            ? '<div data-node-id="list" data-type="NodeList" data-subtype="o"><div data-node-id="item" data-type="NodeListItem" data-marker="1.">' + block('old', '已有说明') + '</div></div>' : '';
+        const html = block('body', '正文 /jz 后') + tail;
+        let id = 0;
+        const tx = h.model.prepareInsertion(h.snapshot(html), 'body', 3, 6, '/jz', () => `new-${++id}`, {preferences: h.model.DEFAULT_PREFERENCES, content});
+        const fragment = h.document.createElement('div');
+        fragment.innerHTML = tx.forward.filter(op => op.action === 'insert').map(op => op.data).join('');
+        const definition = fragment.querySelector(`[data-node-id="${tx.definitionId}"] [contenteditable="true"]`);
+        assert.equal(definition.textContent, mode === 'literal' ? `[^${tx.label}]: ${content}` : content, mode);
+        assert.equal(fragment.querySelector('img'), null, mode);
+        assert.equal(tx.undo.filter(op => op.action === 'delete').length, tx.forward.filter(op => op.action === 'insert').length);
+        assert.equal(tx.undo.find(op => op.action === 'update').data, h.snapshot(html).blocks[0].outerHTML);
+    }
+});
+
+test('picker requires confirmation to create entered content and preserves the draft after failed submission', async () => {
+    const h = host(), html = block('body', '正文 /jz 后');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+    await h.manager.insert(editor, slashContext(h, editor));
+    const dialog = h.dialogs.at(-1).element, draft = dialog.querySelector('[data-picker-content]');
+    draft.value = '直接输入的说明';
+    const transaction = editor.transaction; editor.transaction = () => {throw Error('提交失败');};
+    draft.dispatchEvent(Object.assign(new h.document.defaultView.Event('keydown', {bubbles: true}), {key: 'Enter', ctrlKey: true}));
+    await settle(); assert.equal(h.transactions.length, 0);
+    dialog.querySelector('[data-picker-submit]').click(); await settle();
+    assert.equal(h.transactions.length, 0);
+    assert.equal(draft.value, '直接输入的说明'); assert.equal(draft.disabled, false);
+    assert.equal(dialog.querySelector('[data-picker-search]').disabled, false);
+    editor.transaction = transaction;
+    dialog.querySelector('[data-picker-submit]').click(); await settle();
+    assert.equal(h.transactions.length, 1);
+    assert.match(h.transactions[0].forward.filter(op => op.action === 'insert').map(op => op.data).join(''), /直接输入的说明/);
+    assert.equal(h.manager.pendingSelection.focus, true);
+});
+
+test('picker selection and create mode change the confirmation label without writing or losing the draft', async () => {
+    const h = host(), html = block('body', '正文 /jz 后') + block('a', '[^1]: One') + block('b', '[^2]: Two');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+    await h.manager.insert(editor, slashContext(h, editor));
+    const dialog = h.dialogs.at(-1).element, submit = dialog.querySelector('[data-picker-submit]');
+    assert.equal(submit.textContent, '插入脚注');
+    assert.equal(dialog.querySelector('[data-picker-draft]').hidden, true);
+    dialog.querySelector('[data-definition-id="b"]').click();
+    assert.equal(dialog.querySelector('[aria-selected="true"]').dataset.definitionId, 'b');
+    assert.equal(submit.textContent, '插入脚注');
+    dialog.querySelector('[data-picker-create]').click();
+    assert.equal(submit.textContent, '新建脚注');
+    assert.equal(dialog.querySelector('[data-picker-draft]').hidden, false);
+    assert.equal(dialog.querySelector('[aria-selected="true"]'), null);
+    dialog.querySelector('[data-picker-content]').value = '保留草稿';
+    dialog.querySelector('[data-definition-id="a"]').click();
+    assert.equal(submit.textContent, '插入脚注');
+    dialog.querySelector('[data-picker-create]').click();
+    assert.equal(dialog.querySelector('[data-picker-content]').value, '保留草稿');
+    assert.equal(h.transactions.length, 0);
+    submit.click(); await settle();
+    assert.equal(h.transactions.length, 1);
+    assert.match(h.transactions[0].forward.filter(op => op.action === 'insert').map(op => op.data).join(''), /保留草稿/);
+});
+
+test("sidebar persists mode and dependent preferences, only exposes manual refresh with live refresh off", () => {
+    const h = host(); h.addEditor("doc", block("body", "正文")); h.manager.register(); const panel = h.mount();
+    const select = (selector, value) => {
+        panel.querySelector(`${selector} option[value="${value}"]`).selected = true;
+        panel.querySelector(selector).dispatchEvent(new h.document.defaultView.Event("change"));
+    };
+    assert.equal(panel.querySelector('select'), panel.querySelector('[data-reference-format-field] select'));
+    assert.equal(panel.querySelector('.siyuan-footnote-sidebar__display').hidden, true);
+    select('select', 'text');
+    assert.equal(panel.querySelector('.siyuan-footnote-sidebar__display').hidden, false);
+    assert.equal(panel.querySelector('[data-action="refresh"]').hidden, true);
+    panel.querySelector('[data-live-refresh]').checked = false;
+    panel.querySelector('[data-live-refresh]').dispatchEvent(new h.document.defaultView.Event("change"));
+    assert.equal(panel.querySelector('[data-action="refresh"]').hidden, false);
+    select('select', 'block'); select('[data-block-label]', 'brackets'); select('[data-definition-format]', 'literal');
+    select('select', 'text'); select('select', 'block');
+    assert.equal(panel.querySelector('[data-block-label]').value, 'brackets');
+    assert.equal(panel.querySelector('[data-definition-format]').value, 'literal');
+    const replacement = h.mount();
+    assert.equal(replacement.querySelector('[data-block-label]').value, 'brackets');
+    assert.equal(replacement.querySelector('[data-definition-format]').value, 'literal');
+    assert.equal(replacement.querySelector('[data-live-refresh]').checked, false);
+    assert.equal(h.transactions.length, 0);
+});
+
+test("format audit is read-only, ignores temporary styles, reports every requested mismatch", () => {
+    const h = host();
+    const html = block("body", '[^9]') + block('d', '[^9]: 内容');
+    const snapshot = h.snapshot(html), before = snapshot.signature;
+    const issues = h.model.auditFootnoteFormat(snapshot, h.model.DEFAULT_PREFERENCES);
+    for (const expected of ['引用写法', '定义格式', '引用上标', '连续编号']) assert.ok(issues.includes(expected));
+    assert.equal(snapshot.container.firstElementChild.outerHTML, h.snapshot(before).container.firstElementChild.outerHTML);
+    const tx = h.model.prepareNormalization(h.snapshot(html), h.model.DEFAULT_PREFERENCES, (() => {let i = 0; return () => `audit-${++i}`;})());
+    const normalized = replay(h, before, tx.forward);
+    assert.deepEqual(Array.from(h.model.auditFootnoteFormat(h.snapshot(normalized), h.model.DEFAULT_PREFERENCES)), []);
+    const prefs = {...h.model.DEFAULT_PREFERENCES, superscript: false};
+    assert.deepEqual(Array.from(h.model.auditFootnoteFormat(h.snapshot(normalized), prefs)), []);
+    const pending = h.snapshot(html); pending.pending = true;
+    assert.deepEqual(Array.from(h.model.auditFootnoteFormat(pending, prefs)), []);
+});
+
+test("picker opens before the document read finishes, cancellation and late reads never write", async () => {
+    const h = host(), html = block('body', '正文 /jz 后');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const source = slashContext(h, editor);
+    const finish = h.deferRead(); const opening = h.manager.insert(editor, source);
+    assert.equal(h.dialogs.length, 1);
+    assert.equal(h.dialogs[0].element.querySelector('[data-picker-submit]').disabled, true);
+    h.dialogs[0].element.querySelector('[data-picker-cancel]').click(); finish(html); await opening;
+    assert.equal(h.transactions.length, 0); assert.equal(h.manager.insertionDialog, undefined);
+    assert.equal(h.model.documentContentSignature(editor.protyle.wysiwyg.element.innerHTML), h.model.documentContentSignature(html));
+});
+
+test("picker reuses existing definitions without IDs or waiting on pending document saves", async () => {
+    const h = host(), html = block('body', '正文 /jz 后') + block('d', '[^7]: 已有脚注');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+    editor.flushPendingTransactions = () => {throw Error('must not flush the document');};
+    editor.protyle.wysiwyg.element.insertAdjacentHTML('beforeend', block('unsaved', '尚未保存'));
+    const source = slashContext(h, editor); delete h.hostWindow.Lute;
+    await h.manager.insert(editor, source);
+    const button = h.dialogs.at(-1).element.querySelector('[data-definition-id="d"]');
+    assert.match(button.textContent, /已有脚注/); button.click(); await settle();
+    assert.equal(h.transactions.length, 0);
+    h.dialogs.at(-1).element.querySelector('[data-picker-submit]').click(); await settle();
+    assert.equal(h.transactions.length, 1); const tx = h.transactions[0];
+    assert.equal(tx.forward.length, 1); assert.equal(tx.forward[0].id, 'body');
+    assert.match(tx.forward[0].data, /data-id="d"/); assert.match(tx.forward[0].data, /block-ref sup/);
+    assert.equal(h.manager.pendingSelection.focus, false);
+    assert.ok(editor.protyle.wysiwyg.element.querySelector('[data-node-id="unsaved"]'));
+});
+
+test("picker creates text references from preferences and includes queued definitions when allocating numbers", async () => {
+    const h = host(), html = block('body', '正文 /jz 后');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    panel.querySelector('select option[value="text"]').selected = true;
+    panel.querySelector('select').dispatchEvent(new h.document.defaultView.Event('change'));
+    editor.protyle.wysiwyg.element.insertAdjacentHTML('beforeend', block('queued-note', '[^1]: 队列中的脚注'));
+    await h.manager.insert(editor, slashContext(h, editor));
+    confirmNewFootnote(h); await settle();
+    assert.equal(h.transactions.length, 1); const tx = h.transactions[0];
+    assert.match(tx.forward.at(-1).data, /data-type="sup">\[\^2\]/);
+    assert.doesNotMatch(tx.forward.at(-1).data, /block-ref|data-footnote-insertion/);
+    assert.match(tx.forward.find(op => op.action === 'insert' && op.data.includes('[^2]:')).data, /\[\^2\]:/);
+    assert.equal(h.manager.pendingSelection.focus, true);
+});
+
+test("source changes, target removal, readonly and document switches prevent picker writes", async () => {
+    for (const change of ['source', 'target', 'switch', 'readonly']) {
+        const h = host(), html = block('body', '正文 /jz 后') + block('d', '[^1]: 内容');
+        const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+        await h.manager.insert(editor, slashContext(h, editor));
+        const dialog = h.dialogs.at(-1);
+        if (change === 'source') editor.protyle.wysiwyg.element.firstElementChild.querySelector('[contenteditable]').textContent = 'changed';
+        if (change === 'target') {editor.protyle.wysiwyg.element.lastElementChild.remove(); h.setDOM(block('body', '正文 /jz 后'));}
+        if (change === 'switch') h.addEditor('other', block('other-body', '另一个文档'));
+        if (change === 'readonly') editor.protyle.disabled = true;
+        dialog.element.querySelector('[data-definition-id="d"]').click(); await settle();
+        dialog.element.querySelector('[data-picker-submit]').click(); await settle();
+        assert.equal(h.transactions.length, 0, change); assert.match(dialog.element.querySelector('[data-picker-status]').textContent, /改变|只读|切换/);
+    }
+});
+
+test("unrelated edits do not invalidate insertion and rejected native transactions restore the slash range", async () => {
+    for (const fail of [false, true]) {
+        const h = host(), html = block('body', '正文 /jz 后') + block('other', '另一个块');
+        const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register();
+        await h.manager.insert(editor, slashContext(h, editor));
+        editor.protyle.wysiwyg.element.lastElementChild.querySelector('[contenteditable]').textContent = '新的正文';
+        h.manager.revision++;
+        if (fail) editor.transaction = () => {throw Error('submit failed');};
+        confirmNewFootnote(h); await settle();
+        assert.equal(h.transactions.length, fail ? 0 : 1);
+        const root = editor.protyle.wysiwyg.element;
+        assert.match(root.querySelector('[data-node-id="other"]').textContent, /新的正文/);
+        if (fail) {assert.match(root.firstElementChild.textContent, /\/jz/); assert.equal(root.querySelectorAll('[data-type="NodeList"]').length, 0);}
+    }
+});
+
+test("manual refresh defers through composition and duplicate or missing entries cannot be selected", async () => {
+    const h = host(), html = block('body', '正文 /jz 后 [^missing]') + block('a', '[^1]: A') + block('b', '[^1]: B');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    h.manager.composing = true;
+    panel.querySelector('[data-action="refresh"]').click(); assert.equal(h.manager.manualRefreshPending, true);
+    h.document.dispatchEvent(new h.document.defaultView.Event('compositionend'));
+    assert.equal(h.manager.manualRefreshPending, false);
+    await h.manager.insert(editor, slashContext(h, editor));
+    const buttons = h.dialogs.at(-1).element.querySelectorAll('[data-definition-id]');
+    assert.equal(buttons.length, 3); for (const button of buttons) assert.equal(button.disabled, true);
+    assert.equal(h.dialogs.at(-1).element.querySelector('[data-picker-submit]').disabled, false);
+});
+
+
+test("insertion into a queued new paragraph follows native creation without rewriting other blocks", async () => {
+    const h = host(), saved = block('existing', '已保存正文'), html = block('body', '正文 /jz 后') + saved;
+    const editor = h.addEditor('doc', html); h.setDOM(saved); h.manager.register();
+    await h.manager.insert(editor, slashContext(h, editor));
+    confirmNewFootnote(h); await settle();
+    assert.equal(h.transactions.length, 1);
+    const tx = h.transactions[0];
+    assert.equal(tx.forward.some(op => op.id === 'existing'), false);
+    const nativeCreation = {action: 'insert', id: 'body', data: h.snapshot(html).blocks[0].outerHTML,
+        parentID: 'doc', nextID: 'existing'};
+    const result = replay(h, h.snapshot(saved).signature, [nativeCreation, ...tx.forward]);
+    assert.equal(h.snapshot(result).notes.length, 1);
+    assert.equal(h.snapshot(result).notes[0].references.length, 1);
+    assert.match(replay(h, result, tx.undo), /正文 \/jz 后/);
+});
+
+
+test("insertion content comparison ignores empty styles and transient wrappers but detects real formatting", () => {
+    const h = host(), plain = block('body', '正文 [^1] /jz');
+    const decorated = block('body', '正文 <span class="siyuan-footnote-ref" data-siyuan-footnote-enhanced="true" data-preview="预览">[^1]</span> /jz')
+        .replace('contenteditable="true"', 'contenteditable="true" style=""');
+    assert.equal(h.model.documentContentSignature(plain), h.model.documentContentSignature(decorated));
+    assert.notEqual(h.model.documentContentSignature(plain), h.model.documentContentSignature(plain.replace('[^1]', '<b>[^1]</b>')));
+    const snapshot = h.snapshot(plain), before = snapshot.container.firstElementChild.outerHTML;
+    h.model.documentContentSignature(snapshot.container);
+    assert.equal(snapshot.container.firstElementChild.outerHTML, before, 'comparison must remain read-only');
+});
+
+
+function largeSidebarSnapshot(h, count = 1000, paragraphs = 125) {
+    const snapshot = h.snapshot(block('d0', '[^1]: 内容'));
+    const refs = Array.from({length: paragraphs}, (_, i) => ({blockId: `p${i}`, heading: '章节', excerpt: `第 ${i} 段正文`, kind: 'text', label: '1'}));
+    refs.push({...refs[0]});
+    snapshot.notes = Array.from({length: count}, (_, i) => ({key: `d${i}`, blockId: `d${i}`, label: String(i + 1),
+        content: `脚注内容 ${i}`, references: i === 0 ? refs : [], duplicate: false, missing: false}));
+    snapshot.references = refs;
+    return snapshot;
+}
+
+function scrollListEdge(h, panel, kind, edge = 'end') {
+    const root = kind === '脚注候选' ? panel.querySelector('[data-picker-notes]')
+        : kind === '脚注' ? panel.querySelector('.siyuan-footnote-sidebar__list') : panel.querySelector('[data-panel-content="notes"]');
+    root.getBoundingClientRect = () => ({top: 0, bottom: 200});
+    for (const sentinel of panel.querySelectorAll(`[data-list-kind="${kind}"]`)) {
+        const near = sentinel.dataset.listEdge === edge;
+        sentinel.getBoundingClientRect = () => ({top: near ? 100 : 1000, bottom: near ? 101 : 1001});
+    }
+    root.dispatchEvent(new h.document.defaultView.Event('scroll'));
+}
+
+test('large sidebars render bounded first batches and preserve full counts and automatic scroll loading', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar, snapshot = largeSidebarSnapshot(h);
+    sidebar.render(snapshot, '大文档');
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 40);
+    assert.equal(panel.querySelectorAll('.siyuan-footnote-sidebar__reference').length, 30);
+    assert.match(panel.querySelector('.siyuan-footnote-sidebar__status').textContent, /1000 个脚注 · 126 处引用/);
+    assert.equal(panel.querySelector('.siyuan-footnote-sidebar__reference-count').textContent, '125');
+    assert.match(panel.querySelector('[data-block-id="p0"]').textContent, /2 次/);
+    const first = panel.querySelector('[data-note-key="d0"]');
+    scrollListEdge(h, panel, '脚注');
+    scrollListEdge(h, panel, '段落');
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 80);
+    assert.equal(panel.querySelectorAll('.siyuan-footnote-sidebar__reference').length, 60);
+    assert.equal(panel.querySelector('[data-note-key="d0"]'), first);
+    panel.querySelector('[data-block-id="p59"]').click();
+    assert.equal(h.opens.at(-1), 'p59');
+    assert.equal(h.transactions.length, 0);
+});
+
+test('unchanged sidebar rows, scroll positions and the native editor survive fresh snapshots', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar; sidebar.render(largeSidebarSnapshot(h), '大文档');
+    scrollListEdge(h, panel, '脚注'); scrollListEdge(h, panel, '段落');
+    const row = panel.querySelector('[data-note-key="d1"]'), refRow = panel.querySelector('[data-block-id="p1"]');
+    const list = panel.querySelector('.siyuan-footnote-sidebar__list'); list.scrollTop = 230;
+    const editor = sidebar.protyle, next = largeSidebarSnapshot(h);
+    sidebar.render(next, '大文档');
+    assert.equal(panel.querySelector('[data-note-key="d1"]'), row);
+    assert.equal(panel.querySelector('[data-block-id="p1"]'), refRow);
+    assert.equal(list.scrollTop, 230); assert.equal(sidebar.protyle, editor);
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 80);
+    next.notes[1] = {...next.notes[1], content: '只更新这一项'};
+    sidebar.render(next, '大文档');
+    assert.notEqual(panel.querySelector('[data-note-key="d1"]'), row);
+    assert.match(panel.querySelector('[data-note-key="d1"]').textContent, /只更新这一项/);
+    assert.equal(panel.querySelector('[data-block-id="p1"]'), refRow);
+    assert.equal(h.nativeEditors.length, 1);
+});
+
+test('selecting a distant note pins only that row and switching documents resets the batch', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar, snapshot = largeSidebarSnapshot(h);
+    sidebar.render(snapshot, '大文档'); sidebar.selectNew('d999', false); sidebar.render(snapshot, '大文档');
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 41);
+    assert.equal(panel.querySelector('[data-note-key="d999"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(sidebar.protyle.wysiwyg.element.firstElementChild.dataset.nodeId, 'd999');
+    const small = largeSidebarSnapshot(h, 3); small.rootId = 'other';
+    sidebar.render(small, '另一文档');
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 3);
+    assert.equal(panel.querySelector('[data-list-kind="脚注"][data-list-edge="end"]').hidden, true);
+    sidebar.clear();
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 0);
+    assert.equal(panel.querySelectorAll('.siyuan-footnote-sidebar__reference').length, 0);
+});
+
+test('scroll observers append batches and disconnect on sidebar suspension and destruction', () => {
+    const h = host(), observers = [];
+    h.hostWindow.IntersectionObserver = class {
+        constructor(callback, options) {this.callback = callback; this.options = options; observers.push(this);}
+        observe(target) {this.target = target; this.disconnected = false;}
+        disconnect() {this.disconnected = true;}
+        intersect() {this.callback([{isIntersecting: true, target: this.target}]);}
+    };
+    h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar; sidebar.render(largeSidebarSnapshot(h), '大文档');
+    observers[0].intersect(); assert.equal(panel.querySelectorAll('[data-note-key]').length, 80);
+    sidebar.suspend(); assert.ok(observers.every(observer => observer.disconnected));
+    observers[0].intersect(); assert.equal(panel.querySelectorAll('[data-note-key]').length, 80);
+    sidebar.resume(); observers[0].intersect(); assert.equal(panel.querySelectorAll('[data-note-key]').length, 120);
+    sidebar.destroy(); assert.ok(observers.every(observer => observer.disconnected));
+    observers[0].intersect(); assert.equal(panel.querySelectorAll('[data-note-key]').length, 0);
+});
+
+test('simultaneous sidebar refreshes share one read and a document switch does not wait for it', async () => {
+    const h = host(), html = block('d', '[^1]: 当前文档');
+    const main = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount(); h.timers.clear();
+    const api = h.api.fetchSyncPost; let reads = 0;
+    h.api.fetchSyncPost = (...args) => {reads++; return api(...args);};
+    const finish = h.deferRead();
+    const first = h.manager.refresh(), second = h.manager.refresh();
+    assert.equal(reads, 1); finish(html); await Promise.all([first, second]);
+    assert.equal(h.timers.size, 0, 'unchanged duplicate refresh must not queue another full read');
+    let release;
+    h.api.fetchSyncPost = (url, args) => args.id === 'doc' ? new Promise(resolve => {release = resolve;})
+        : Promise.resolve({code: 0, data: {dom: block('new-note', '[^2]: 新文档')}});
+    const old = h.manager.refresh();
+    const other = h.addEditor('other', block('new-note', '[^2]: 新文档'));
+    h.emit('switch-protyle', {protyle: other.protyle}); await h.manager.refresh();
+    assert.match(panel.querySelector('[data-note-key="new-note"]').textContent, /新文档/);
+    release({code: 0, data: {dom: html}}); await old;
+    assert.equal(h.manager.snapshot.rootId, 'other');
+});
+
+
+function locateNumber(h, panel, value) {
+    const input = panel.querySelector('[data-locate-number]'); input.value = value;
+    panel.querySelector('.siyuan-footnote-sidebar__quick-locate').dispatchEvent(new h.document.defaultView.Event('submit', {cancelable: true}));
+}
+
+test('number locator reveals an unloaded note without expanding all preceding batches', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar; sidebar.render(largeSidebarSnapshot(h), '大文档');
+    locateNumber(h, panel, '  [^1000]  ');
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 80);
+    assert.equal(panel.querySelector('[data-note-key="d999"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(sidebar.protyle.wysiwyg.element.firstElementChild.dataset.nodeId, 'd999');
+    assert.match(panel.querySelector('[data-locate-status]').textContent, /已定位脚注 \[\^1000\]/);
+    sidebar.render(largeSidebarSnapshot(h), '大文档');
+    assert.equal(panel.querySelector('[data-note-key="d999"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(panel.querySelector('[data-locate-number]').value, '  [^1000]  ');
+    assert.equal(h.transactions.length, 0);
+});
+
+test('number locator accepts plain and bracketed labels and does not change selection on failure', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar; sidebar.render(largeSidebarSnapshot(h, 3), '文档');
+    for (const value of ['2', '[2]', '[^2]']) {
+        locateNumber(h, panel, value);
+        assert.equal(panel.querySelector('[data-note-key="d1"]').getAttribute('aria-pressed'), 'true');
+    }
+    const editor = sidebar.protyle;
+    locateNumber(h, panel, '999');
+    assert.match(panel.querySelector('[data-locate-status]').textContent, /未找到编号 999/);
+    assert.equal(panel.querySelector('[data-locate-number]').getAttribute('aria-invalid'), 'true');
+    assert.equal(sidebar.protyle, editor);
+    locateNumber(h, panel, '   '); assert.match(panel.querySelector('[data-locate-status]').textContent, /请输入/);
+    panel.querySelector('[data-locate-number]').dispatchEvent(new h.document.defaultView.Event('input'));
+    assert.equal(panel.querySelector('[data-locate-status]').hidden, true);
+    const snapshot = h.snapshot(block('a', '[^A]: 字母编号')); sidebar.render(snapshot, '文档');
+    locateNumber(h, panel, '[^A]'); assert.equal(sidebar.protyle.wysiwyg.element.firstElementChild.dataset.nodeId, 'a');
+    snapshot.rootId = 'other'; sidebar.render(snapshot, '另一文档');
+    assert.equal(panel.querySelector('[data-locate-number]').value, '');
+    assert.equal(panel.querySelector('[data-locate-status]').hidden, true);
+});
+
+test('number locator cycles duplicate definitions and locates missing definitions in readonly documents', () => {
+    const h = host(), html = block('body', '正文 [^1] [^missing]') + block('a', '[^1]: 第一条') + block('b', '[^1]: 第二条');
+    h.addEditor('doc', html); h.manager.register(); const panel = h.mount();
+    h.hostWindow.siyuan.config.readonly = true; h.manager.sidebar.render(h.snapshot(html), '文档');
+    assert.equal(panel.querySelector('[data-locate-number]').disabled, false);
+    assert.equal(panel.querySelector('[data-action="normalize"]').disabled, true);
+    for (const id of ['a', 'b', 'a']) {
+        locateNumber(h, panel, '1');
+        assert.equal(h.manager.sidebar.protyle.wysiwyg.element.firstElementChild.dataset.nodeId, id);
+        const native = h.nativeEditors.at(-1); native.options.after(native);
+        assert.equal(h.manager.sidebar.protyle.disabled, true);
+        assert.match(panel.querySelector('[data-locate-status]').textContent, /有 2 条脚注/);
+    }
+    locateNumber(h, panel, 'missing');
+    assert.equal(h.manager.sidebar.protyle, undefined);
+    assert.match(panel.querySelector('[data-locate-status]').textContent, /缺失定义/);
+    assert.ok(panel.querySelector('.siyuan-footnote-sidebar__reference[data-block-id="body"]'));
+    assert.equal(h.transactions.length, 0);
+});
+
+test('number locator respects busy/loading state and composition Enter does not submit', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar;
+    assert.equal(panel.querySelector('[data-locate-number]').disabled, true);
+    sidebar.render(largeSidebarSnapshot(h, 3), '文档'); sidebar.setBusy(true);
+    locateNumber(h, panel, '3'); assert.equal(panel.querySelector('[data-note-key="d0"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(panel.querySelector('[data-action="locate-number"]').disabled, true);
+    sidebar.setBusy(false);
+    const input = panel.querySelector('[data-locate-number]');
+    const composing = new h.document.defaultView.Event('keydown', {cancelable: true});
+    Object.assign(composing, {key: 'Enter', isComposing: true}); input.dispatchEvent(composing);
+    assert.equal(composing.defaultPrevented, true);
+    locateNumber(h, panel, '3'); assert.equal(panel.querySelector('[data-note-key="d2"]').getAttribute('aria-pressed'), 'true');
+    sidebar.clear(); assert.equal(input.value, ''); assert.equal(input.disabled, true);
+});
+
+
+test('one lookup of 467 loads its surrounding page and later batches cannot push it down', () => {
+    const h = host(), observers = [];
+    h.hostWindow.IntersectionObserver = class {
+        constructor(callback) {this.callback = callback; observers.push(this);}
+        observe() {} disconnect() {}
+    };
+    h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar; sidebar.render(largeSidebarSnapshot(h), '大文档');
+    locateNumber(h, panel, '467');
+    const rows = () => Array.from(panel.querySelectorAll('[data-note-key]'));
+    const target = panel.querySelector('[data-note-key="d466"]');
+    assert.equal(rows().length, 120); assert.equal(rows()[0].dataset.noteKey, 'd400');
+    assert.equal(rows().indexOf(target), 66);
+    // A queued intersection callback may still arrive after programmatic scrolling.
+    observers[0].callback([{isIntersecting: true, target: panel.querySelector('[data-list-kind="脚注"][data-list-edge="end"]')}]);
+    assert.equal(rows().length, 160); assert.equal(rows().indexOf(target), 66);
+    sidebar.render(largeSidebarSnapshot(h), '大文档');
+    assert.equal(rows().indexOf(target), 66); assert.equal(target.getAttribute('aria-pressed'), 'true');
+    observers[0].callback([{isIntersecting: true, target: panel.querySelector('[data-list-kind="脚注"][data-list-edge="start"]')}]);
+    assert.equal(rows()[0].dataset.noteKey, 'd360');
+    locateNumber(h, panel, '1');
+    assert.equal(rows().length, 80); assert.equal(rows()[0].dataset.noteKey, 'd0');
+    assert.equal(panel.querySelector('[data-list-kind="脚注"][data-list-edge="start"]').hidden, true);
+    assert.equal(h.transactions.length, 0);
+});
+
+test('page-boundary lookups remain in sorted windows with correct loading controls', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    h.manager.sidebar.render(largeSidebarSnapshot(h), '大文档');
+    for (const label of ['40', '41', '480', '1000', '467']) {
+        locateNumber(h, panel, label);
+        const keys = Array.from(panel.querySelectorAll('[data-note-key]'), row => Number(row.dataset.noteKey.slice(1)));
+        assert.ok(keys.length >= 40 && keys.length <= 120);
+        assert.deepEqual(keys, keys.slice().sort((a, b) => a - b));
+        assert.ok(keys.includes(Number(label) - 1));
+        assert.equal(panel.querySelector('[data-list-kind="脚注"][data-list-edge="end"]').hidden, label === '1000');
+        assert.equal(panel.querySelector(`[data-note-key="d${Number(label) - 1}"]`).getAttribute('aria-pressed'), 'true');
+    }
+});
+
+
+test('separate notes and settings panels retain editing state and defer hidden list updates', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    const sidebar = h.manager.sidebar; sidebar.render(largeSidebarSnapshot(h), '大文档');
+    const editor = sidebar.protyle, original = panel.querySelector('[data-note-key="d1"]');
+    assert.equal(panel.querySelector('[data-panel-content="settings"]').hidden, true);
+    assert.ok(panel.querySelector('[data-panel-content="settings"] [data-action="normalize"]'));
+    assert.ok(panel.querySelector('[data-panel-content="settings"] [data-action="check-duplicates"]'));
+    assert.ok(panel.querySelector('[data-panel-content="notes"] [data-locate-number]'));
+    assert.equal(panel.querySelectorAll('[data-load-more], [data-load-earlier]').length, 0);
+    panel.querySelector('[data-panel="settings"]').click();
+    assert.equal(panel.querySelector('[data-panel-content="notes"]').hidden, true);
+    assert.equal(panel.querySelector('[data-panel="settings"]').getAttribute('aria-selected'), 'true');
+    const next = largeSidebarSnapshot(h); next.notes[1].content = '新内容';
+    sidebar.render(next, '大文档'); scrollListEdge(h, panel, '脚注');
+    assert.equal(panel.querySelectorAll('[data-note-key]').length, 40);
+    assert.equal(panel.querySelector('[data-note-key="d1"]'), original);
+    assert.equal(sidebar.protyle, editor);
+    panel.querySelector('[data-panel="notes"]').click();
+    assert.notEqual(panel.querySelector('[data-note-key="d1"]'), original);
+    assert.match(panel.querySelector('[data-note-key="d1"]').textContent, /新内容/);
+    assert.equal(sidebar.protyle, editor); assert.equal(h.transactions.length, 0);
+    sidebar.showPanel('settings'); const other = largeSidebarSnapshot(h, 3); other.rootId = 'other';
+    sidebar.render(other, '新文档'); assert.equal(sidebar.protyle, undefined);
+    sidebar.showPanel('notes'); assert.equal(panel.querySelectorAll('[data-note-key]').length, 3);
+});
+
+test('automatic upward loading compensates visual displacement of existing rows', () => {
+    const h = host(); h.addEditor('doc', block('body', '正文')); h.manager.register(); const panel = h.mount();
+    h.manager.sidebar.render(largeSidebarSnapshot(h), '大文档'); locateNumber(h, panel, '467');
+    const list = panel.querySelector('.siyuan-footnote-sidebar__list'); list.scrollTop = 10;
+    const anchor = panel.querySelector('[data-note-key="d400"]');
+    anchor.getBoundingClientRect = () => ({top: panel.querySelector('[data-note-key="d360"]') ? 2400 : 0});
+    scrollListEdge(h, panel, '脚注', 'start');
+    assert.ok(panel.querySelector('[data-note-key="d360"]'));
+    assert.equal(list.scrollTop, 2410);
+    assert.equal(panel.querySelector('[data-note-key="d466"]').getAttribute('aria-pressed'), 'true');
 });
