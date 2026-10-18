@@ -1,5 +1,5 @@
 import {Dialog, confirm, fetchSyncPost, getActiveEditor, getAllEditor, getFrontend, IOperation, IProtyle, Plugin, Protyle, showMessage} from "siyuan";
-import {applyInsertionToEditor, applyNormalizationToEditor, auditFootnoteFormat, buildDocumentSnapshot, documentContentSignature, DEFAULT_PREFERENCES, DocumentSnapshot, FootnotePreferences, includeQueuedBlocks, NormalizationOptions, prepareInsertion, prepareNormalization, resolveNormalizationOptions} from "./document";
+import {applyInsertionToEditor, applyNormalizationToEditor, buildDocumentSnapshot, documentContentSignature, DEFAULT_PREFERENCES, DocumentSnapshot, FootnotePreferences, includeQueuedBlocks, NormalizationOptions, prepareInsertion, prepareNormalization, resolveNormalizationOptions} from "./document";
 import {FootnoteSidebar, IncrementalList} from "./sidebar";
 import {flushDocumentEdits} from "./editing";
 
@@ -20,8 +20,20 @@ interface ManagerHost {
     setPreferences?(preferences: FootnotePreferences): void;
     liveRefresh?(): boolean;
     setLiveRefresh?(enabled: boolean): void;
+    panelAutoRefresh?(): boolean;
+    setPanelAutoRefresh?(enabled: boolean): void;
     manualRefresh?(editor: Protyle): void | Promise<void>;
     checkDuplicates?(anchor: HTMLElement, editor?: Protyle): void;
+}
+
+interface PanelRefresh {
+    editor?: Protyle;
+    rootId?: string;
+    promise?: Promise<void>;
+    revision: number;
+    request: number;
+    rerun: boolean;
+    required: boolean;
 }
 
 export class FootnoteManager {
@@ -29,6 +41,11 @@ export class FootnoteManager {
     private main?: Protyle;
     private mainRootId?: string;
     private timer = 0;
+    private timerRequired = false;
+    private timerAt = 0;
+    private panelAutoRefresh = true;
+    private session = 0;
+    private manualRefreshing = false;
     private disposed = false;
     private busy = false;
     private composing = false;
@@ -38,33 +55,43 @@ export class FootnoteManager {
     private visible = false;
     private pendingSelection?: {rootId: string; blockId: string; focus?: boolean};
     private snapshot?: DocumentSnapshot;
-    private formatIssues: string[] = [];
-    private refreshing?: {editor?: Protyle; rootId?: string; promise?: Promise<void>; revision: number; request: number; rerun: boolean};
+    private refreshing?: PanelRefresh;
     private insertionDialog?: Dialog;
     private manualRefreshPending = false;
     private previousLabels = new Map<string, Map<string, string>>();
 
-    constructor(private plugin: Plugin, private host: ManagerHost) {}
+    constructor(private plugin: Plugin, private host: ManagerHost) {
+        this.panelAutoRefresh = host.panelAutoRefresh?.() ?? true;
+    }
 
     register() {
         this.plugin.addDock({
             type: DOCK_TYPE, data: {},
             config: {position: "RightTop", size: {width: 360, height: 0}, icon: "iconFootnoteJumper", title: "脚注"},
             init: (dock) => {
+                this.cancelPanelRefresh();
+                this.visible = false;
                 this.sidebar?.destroy();
                 this.sidebar = new FootnoteSidebar(dock.element as HTMLElement, this.plugin.app, {
                     navigate: (id) => void this.host.navigate(id).catch((error) => this.error(error)),
                     normalize: (options) => void this.normalize(options),
                     refresh: () => {
+                        if (this.manualRefreshPending || this.manualRefreshing || this.refreshing || this.busy) return;
                         this.manualRefreshPending = true;
-                        this.performManualRefresh();
+                        this.sidebar?.setRefreshing(true);
+                        void this.performManualRefresh();
                     },
                     preferences: () => this.host.preferences?.() || DEFAULT_PREFERENCES,
                     setPreferences: (preferences) => {this.host.setPreferences?.(preferences); this.schedule(0);},
                     liveRefresh: () => this.host.liveRefresh?.() ?? true,
                     setLiveRefresh: (enabled) => this.host.setLiveRefresh?.(enabled),
+                    panelAutoRefresh: () => this.panelAutoRefresh,
+                    setPanelAutoRefresh: (enabled) => {
+                        this.host.setPanelAutoRefresh?.(enabled);
+                        this.updatePanelAutoRefresh(enabled);
+                    },
                     checkDuplicates: (anchor) => this.host.checkDuplicates?.(anchor, this.main),
-                    ready: () => this.schedule(1000),
+                    ready: () => this.sidebar?.resize(),
                     readonly: () => this.readonly(),
                     jumpEnabled: () => this.host.jumpEnabled(),
                     setJumpEnabled: (enabled) => this.host.setJumpEnabled(enabled),
@@ -75,11 +102,11 @@ export class FootnoteManager {
             update: () => {this.updateVisibility(); this.schedule(0);},
             resize: () => {this.updateVisibility(); this.sidebar?.resize();},
             destroy: () => {
+                this.cancelPanelRefresh();
                 this.visibility?.disconnect();
                 this.sidebar?.destroy();
                 this.sidebar = undefined;
                 this.visible = false;
-                this.request++;
             },
         });
         this.plugin.protyleSlash = [{
@@ -105,30 +132,69 @@ export class FootnoteManager {
     updatePreferences() {
         this.sidebar?.setPreferences(this.host.preferences?.() || DEFAULT_PREFERENCES);
         this.sidebar?.setLiveRefresh(this.host.liveRefresh?.() ?? true);
+        this.updatePanelAutoRefresh(this.host.panelAutoRefresh?.() ?? this.panelAutoRefresh);
         this.schedule(0);
     }
 
-    private performManualRefresh() {
-        if (!this.manualRefreshPending || this.composing) return;
-        this.manualRefreshPending = false;
-        if (this.main) {
-            Promise.resolve(this.host.manualRefresh?.(this.main)).then(() => this.schedule(0), (error) => this.error(error));
+    private updatePanelAutoRefresh(enabled: boolean) {
+        const changed = enabled !== this.panelAutoRefresh;
+        this.panelAutoRefresh = enabled;
+        this.sidebar?.setPanelAutoRefresh(enabled);
+        if (!changed) return;
+        if (enabled) this.schedule(0, true);
+        else {
+            if (!this.timerRequired) {window.clearTimeout(this.timer); this.timer = 0;}
+            if (this.refreshing) this.refreshing.rerun = false;
         }
+    }
+
+    private async performManualRefresh() {
+        if (!this.manualRefreshPending || this.composing || this.manualRefreshing) return;
+        this.manualRefreshPending = false;
+        if (!this.visible || this.disposed) {this.updateRefreshing(); return;}
+        this.captureMain();
+        const editor = this.main, session = this.session;
+        this.manualRefreshing = true;
+        window.clearTimeout(this.timer); this.timer = 0;
+        this.updateRefreshing();
+        try {
+            if (!editor) return;
+            await this.host.manualRefresh?.(editor);
+            if (session === this.session && this.visible && !this.disposed) await this.refresh(true);
+        } catch (error) {
+            if (session === this.session && !this.disposed) this.error(error);
+        } finally {
+            if (session === this.session) {this.manualRefreshing = false; this.updateRefreshing();}
+        }
+    }
+
+    private updateRefreshing() {
+        this.sidebar?.setRefreshing(Boolean(this.manualRefreshPending || this.manualRefreshing || this.refreshing || this.busy));
+    }
+
+    private cancelPanelRefresh() {
+        this.session++;
+        this.request++;
+        window.clearTimeout(this.timer); this.timer = 0;
+        this.refreshing = undefined;
+        this.manualRefreshPending = false;
+        this.manualRefreshing = false;
+        this.updateRefreshing();
     }
 
     private readonly handleSwitch = (event: CustomEvent<{protyle: IProtyle}>) => {
         const protyle = event.detail.protyle;
         if (this.isSidebar(protyle) || !protyle?.block?.rootID) return;
         if (this.main?.protyle !== protyle || this.mainRootId !== protyle.block.rootID) {
+            this.cancelPanelRefresh();
             this.revision++;
-            this.request++;
             this.main = protyle.getInstance?.() || getAllEditor().find((editor) => editor.protyle === protyle);
             this.mainRootId = protyle.block.rootID;
             this.pendingSelection = undefined;
             this.snapshot = undefined;
             this.sidebar?.clear("正在读取脚注…");
+            this.schedule(0, true);
         }
-        this.schedule(0);
     };
 
     private readonly handleLoaded = (event: CustomEvent<{protyle?: IProtyle}>) => {
@@ -139,9 +205,9 @@ export class FootnoteManager {
     };
     private readonly handleDestroyed = (event: CustomEvent<{protyle: IProtyle}>) => {
         if (event.detail.protyle !== this.main?.protyle) return;
+        this.cancelPanelRefresh();
         this.main = undefined;
         this.mainRootId = undefined;
-        this.request++;
         this.sidebar?.clear();
         this.schedule(100);
     };
@@ -216,11 +282,14 @@ export class FootnoteManager {
         const editor = getActiveEditor();
         if (!editor?.protyle?.block?.rootID || this.isSidebar(editor.protyle)) return;
         if (editor !== this.main || editor.protyle.block.rootID !== this.mainRootId) {
+            this.cancelPanelRefresh();
             this.revision++;
-            this.request++;
             this.pendingSelection = undefined;
             this.snapshot = undefined;
             this.sidebar?.clear("正在读取脚注…");
+            this.main = editor;
+            this.mainRootId = editor.protyle.block.rootID;
+            this.schedule(0, true);
         }
         this.main = editor;
         this.mainRootId = editor.protyle.block.rootID;
@@ -243,9 +312,10 @@ export class FootnoteManager {
             () => this.assertWritable(editor), (block) => this.host.tablePending(block));
     }
 
-    private async read(editor: Protyle, insertion = false) {
+    private async read(editor: Protyle, insertion = false, current?: () => boolean) {
         const rootId = editor.protyle.block.rootID;
         const response = await fetchSyncPost("/api/block/getBlockDOM", {id: rootId});
+        if (current && !current()) throw new Error("刷新请求已失效");
         if (response.code !== 0 || typeof response.data?.dom !== "string" || !response.data.dom.trim()) {
             throw new Error("读取全文失败，请重试");
         }
@@ -266,6 +336,7 @@ export class FootnoteManager {
         for (let i = 0; i < targets.length; i += 256) {
             const ids = targets.slice(i, i + 256).map((id) => `'${id.replace(/'/g, "''")}'`).join(",");
             const result = await fetchSyncPost("/api/query/sql", {stmt: `SELECT id, root_id FROM blocks WHERE id IN (${ids}) LIMIT 256`});
+            if (current && !current()) throw new Error("刷新请求已失效");
             if (result.code !== 0 || !Array.isArray(result.data)) throw new Error("读取块引目标失败，请重试");
             for (const row of result.data) if (row.root_id !== rootId) ignored.add(row.id);
         }
@@ -275,45 +346,54 @@ export class FootnoteManager {
         return snapshot;
     }
 
-    private schedule(delay: number) {
-        if (this.disposed) return;
+    private schedule(delay: number, required = false) {
+        if (this.disposed || !this.visible || !this.sidebar || (!required && (!this.panelAutoRefresh || this.manualRefreshing || this.manualRefreshPending))) return;
+        // Automatic events must not postpone an explicit refresh or initial load.
+        if (this.timer && this.timerRequired && (!required || this.timerAt <= Date.now() + delay)) return;
         window.clearTimeout(this.timer);
-        this.timer = window.setTimeout(() => {this.timer = 0; void this.refresh();}, delay);
+        this.timerRequired = required;
+        this.timerAt = Date.now() + delay;
+        this.timer = window.setTimeout(() => {this.timer = 0; void this.refresh(required);}, delay);
     }
 
-    private async refresh() {
+    private async refresh(required = true) {
+        if (this.disposed || !this.visible || !this.sidebar || (!required && !this.panelAutoRefresh)) return;
         this.captureMain();
-        if (this.disposed) return;
+        window.clearTimeout(this.timer); this.timer = 0;
         const current = this.refreshing;
-        if (current && current.editor === this.main && current.rootId === this.mainRootId) {
-            current.rerun = current.rerun || current.revision !== this.revision || current.request !== this.request;
+        if (current && current.editor === this.main && current.rootId === this.mainRootId && current.request === this.request) {
+            current.rerun = current.rerun || current.revision !== this.revision;
+            current.required = current.required || required;
             return current.promise;
         }
-        const state = {editor: this.main, rootId: this.mainRootId, promise: undefined as Promise<void>, revision: this.revision, request: this.request, rerun: false};
+        const state: PanelRefresh = {editor: this.main, rootId: this.mainRootId, revision: this.revision, request: this.request, rerun: false, required};
         this.refreshing = state;
-        state.promise = this.refreshOnce();
+        this.updateRefreshing();
+        state.promise = this.refreshOnce(state);
         state.request = this.request;
         try {await state.promise;}
         finally {
             if (this.refreshing === state) {
                 this.refreshing = undefined;
-                if (state.rerun) this.schedule(0);
+                this.updateRefreshing();
+                if (state.rerun && (state.required || this.panelAutoRefresh) && !this.timer) this.schedule(1000, state.required);
             }
         }
     }
 
-    private async refreshOnce() {
-        if (this.disposed) return;
-        if (this.composing || this.busy) {this.schedule(1000); return;}
+    private async refreshOnce(state: PanelRefresh) {
+        if (this.disposed || !this.visible || !this.sidebar || (!state.required && !this.panelAutoRefresh)) return;
+        if (this.composing || this.busy) {this.schedule(1000, state.required); return;}
         const editor = this.main;
         if (!editor?.protyle?.wysiwyg?.element?.isConnected) {this.sidebar?.clear(); return;}
         const request = ++this.request, revision = this.revision;
+        const current = () => !this.disposed && this.visible && this.main === editor
+            && editor.protyle.block.rootID === state.rootId && request === this.request;
         try {
-            const snapshot = await this.read(editor);
-            if (this.disposed || this.main !== editor || request !== this.request) return;
-            if (revision !== this.revision) {this.schedule(1000); return;}
+            const snapshot = await this.read(editor, false, current);
+            if (!current()) return;
+            if (revision !== this.revision) {this.schedule(1000, state.required); return;}
             this.snapshot = snapshot;
-            this.formatIssues = auditFootnoteFormat(snapshot, this.host.preferences?.() || DEFAULT_PREFERENCES);
             if (!this.visible || !this.sidebar) return;
             if (this.pendingSelection?.rootId === snapshot.rootId
                 && snapshot.notes.some((note) => note.blockId === this.pendingSelection.blockId)) {
@@ -423,7 +503,7 @@ export class FootnoteManager {
             this.sidebar?.invalidateEditor();
             this.host.changed(snapshot.rootId);
             showMessage(`已提交 ${transaction.referenceCount} 处脚注引用的格式整理`);
-            this.schedule(1000);
+            this.schedule(1000, true);
         } catch (error) {this.error(error);}
         finally {this.setBusy(false);}
     }
@@ -565,7 +645,7 @@ export class FootnoteManager {
                 }
                 this.pendingSelection = {rootId, blockId: transaction.definitionId, focus: transaction.created};
                 this.sidebar?.showPanel("notes");
-                this.host.changed(rootId); dialog.destroy(); this.open(); this.schedule(1000);
+                this.host.changed(rootId); dialog.destroy(); this.open(); this.schedule(1000, true);
                 showMessage(`已提交脚注 [^${transaction.label}]，可在侧栏编辑内容`);
             } catch (error) {
                 this.error(error);
@@ -674,7 +754,7 @@ export class FootnoteManager {
             else if (!this.visible) document.querySelector<HTMLElement>(`.dock__item[data-type="${type}"]`)?.click();
         }
         this.updateVisibility();
-        this.schedule(0);
+        this.schedule(0, true);
     }
 
     private observeVisibility() {
@@ -697,23 +777,21 @@ export class FootnoteManager {
         }
         if (visible === this.visible) return;
         this.visible = visible;
-        if (visible) {this.sidebar.resume(); this.schedule(0);}
+        if (visible) {this.sidebar.resume(); this.schedule(0, true);}
         else {
-            this.request++;
-            window.clearTimeout(this.timer);
-            this.timer = 0;
+            this.cancelPanelRefresh();
             this.sidebar?.suspend();
         }
     }
 
-    private setBusy(value: boolean) {this.busy = value; this.sidebar?.setBusy(value);}
+    private setBusy(value: boolean) {this.busy = value; this.sidebar?.setBusy(value); this.updateRefreshing();}
     private error(error: unknown) {showMessage(error instanceof Error ? error.message : "脚注操作失败，请重试", 5000, "error");}
 
     destroy() {
         this.disposed = true;
+        this.cancelPanelRefresh();
         this.insertionDialog?.destroy();
         this.insertionDialog = undefined;
-        this.request++;
         window.clearTimeout(this.timer);
         this.visibility?.disconnect();
         this.plugin.eventBus.off("switch-protyle", this.handleSwitch);

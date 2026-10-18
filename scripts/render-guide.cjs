@@ -99,7 +99,9 @@ async function saveLive(page, filename) {
     await page.locator('.plate').screenshot({path:path.join(output,filename)});
 }
 
-(async () => {
+module.exports = {styles, setupHost, modules, root};
+
+if (require.main === module) (async () => {
     fs.mkdirSync(output, {recursive: true});
     const browser = await chromium.launch({headless: true, executablePath: process.env.FOOTNOTE_BROWSER_EXECUTABLE});
     try {

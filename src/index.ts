@@ -26,6 +26,7 @@ const TABLE_EDIT_MESSAGE = TABLE_SAVE_MESSAGE;
 interface FootnoteSettings {
     enabled: boolean;
     liveRefreshEditingBlock: boolean;
+    panelAutoRefresh: boolean;
     preferences?: FootnotePreferences;
 }
 
@@ -73,6 +74,7 @@ export default class FootnoteJumperPlugin extends Plugin {
     private manualRefreshPending = false;
     private manualRefreshEditor?: IProtyle;
     private liveRefreshEditingBlock = true;
+    private panelAutoRefresh = true;
     private observer?: MutationObserver;
     private refreshTimer = 0;
     private refreshTimerAt = 0;
@@ -382,6 +384,11 @@ export default class FootnoteJumperPlugin extends Plugin {
             setPreferences: (preferences) => this.setPreferences(preferences),
             liveRefresh: () => this.liveRefreshEditingBlock,
             setLiveRefresh: (enabled) => this.setLiveRefreshEditingBlock(enabled),
+            panelAutoRefresh: () => this.panelAutoRefresh,
+            setPanelAutoRefresh: (enabled) => {
+                this.panelAutoRefresh = enabled;
+                this.saveSettings();
+            },
             manualRefresh: (editor) => this.manualRefresh(editor.protyle),
             checkDuplicates: (anchor, editor) => void this.checkDuplicateDefinitions(anchor, editor?.protyle),
             setJumpEnabled: (enabled) => this.setEnabled(enabled),
@@ -500,6 +507,9 @@ export default class FootnoteJumperPlugin extends Plugin {
             if (typeof settings?.liveRefreshEditingBlock === "boolean") {
                 this.liveRefreshEditingBlock = settings.liveRefreshEditingBlock;
             }
+            if (typeof settings?.panelAutoRefresh === "boolean") {
+                this.panelAutoRefresh = settings.panelAutoRefresh;
+            }
         } catch (error) {
             console.warn(`[${this.name}] load settings failed`, error);
         }
@@ -512,6 +522,7 @@ export default class FootnoteJumperPlugin extends Plugin {
         const settings: FootnoteSettings = {
             enabled: this.jumpStyleEnabled,
             liveRefreshEditingBlock: this.liveRefreshEditingBlock,
+            panelAutoRefresh: this.panelAutoRefresh,
             preferences: {...this.preferences},
         };
         this.saveData(STORAGE_NAME, settings).catch((error) => {

@@ -9,6 +9,8 @@ interface SidebarActions {
     setPreferences?(preferences: FootnotePreferences): void;
     liveRefresh?(): boolean;
     setLiveRefresh?(enabled: boolean): void;
+    panelAutoRefresh?(): boolean;
+    setPanelAutoRefresh?(enabled: boolean): void;
     checkDuplicates?(anchor: HTMLElement): void;
     ready(): void;
     readonly(): boolean;
@@ -182,6 +184,8 @@ export class FootnoteSidebar {
     private renumber: HTMLInputElement;
     private jumpStyle: HTMLInputElement;
     private liveRefresh: HTMLInputElement;
+    private panelAutoRefresh: HTMLInputElement;
+    private refreshButton: HTMLButtonElement;
     private generation = 0;
     private focusNew = false;
     private closed = false;
@@ -191,10 +195,12 @@ export class FootnoteSidebar {
     constructor(readonly element: HTMLElement, private app: App, private actions: SidebarActions) {
         element.setAttribute("data-footnote-sidebar", "true");
         element.classList.add("siyuan-footnote-sidebar");
-        element.innerHTML = `<div class="block__icons">
+        element.innerHTML = `<div class="block__icons siyuan-footnote-sidebar__toolbar">
             <div class="block__logo"><svg class="block__logoicon"><use href="#iconFootnoteJumper"></use></svg>脚注</div>
             <span class="fn__flex-1"></span>
-            <button type="button" class="block__icon" data-type="min" aria-label="关闭脚注侧栏" title="关闭脚注侧栏"><svg aria-hidden="true"><use href="#iconMin"></use></svg></button>
+            <label class="siyuan-footnote-sidebar__auto-refresh" title="仅面板打开时自动更新脚注列表；关闭自动刷新后可点击右侧按钮更新"><span>自动刷新</span><input type="checkbox" role="switch" aria-label="面板自动刷新" class="siyuan-footnote-sidebar__switch" data-panel-auto-refresh></label>
+            <button type="button" class="block__icon siyuan-footnote-sidebar__toolbar-button siyuan-footnote-sidebar__refresh" data-action="refresh" aria-label="刷新脚注面板" title="刷新脚注面板"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></button>
+            <button type="button" class="block__icon siyuan-footnote-sidebar__toolbar-button" data-type="min" aria-label="关闭脚注侧栏" title="关闭脚注侧栏"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button>
         </div>
         <div class="siyuan-footnote-sidebar__document">
             <span class="siyuan-footnote-sidebar__eyebrow">当前文档</span>
@@ -205,7 +211,6 @@ export class FootnoteSidebar {
             <button type="button" role="tab" data-panel="settings" aria-selected="false" tabindex="-1">设置</button>
         </div>
         <section class="siyuan-footnote-sidebar__panel" data-panel-content="notes" role="tabpanel">
-        <button type="button" class="b3-button b3-button--outline siyuan-footnote-sidebar__manual-refresh" data-action="refresh">手动刷新</button>
         <div class="siyuan-footnote-sidebar__status" role="status"></div>
         <form class="siyuan-footnote-sidebar__quick-locate" role="search" aria-label="脚注编号快速定位">
             <div class="siyuan-footnote-sidebar__locate-controls">
@@ -235,7 +240,7 @@ export class FootnoteSidebar {
         <div class="siyuan-footnote-sidebar__display">
             <label class="siyuan-footnote-sidebar__display-toggle"><span>脚注跳转样式</span><input type="checkbox" role="switch" class="siyuan-footnote-sidebar__switch" data-jump-style aria-describedby="footnote-jump-style-hint"></label>
             <label class="siyuan-footnote-sidebar__display-toggle"><span>编辑块实时刷新</span><input type="checkbox" role="switch" class="siyuan-footnote-sidebar__switch" data-live-refresh></label>
-            <div id="footnote-jump-style-hint" class="siyuan-footnote-sidebar__hint">匹配文本标记并提供跳转、预览和上标；关闭实时刷新时，离开编辑块后自动匹配。</div>
+            <div id="footnote-jump-style-hint" class="siyuan-footnote-sidebar__hint">用于正文文本标记的匹配、跳转、预览和上标；关闭编辑块实时刷新后，离开编辑块时自动匹配。面板列表由右上角「自动刷新」单独控制。</div>
         </div>
         <div class="siyuan-footnote-sidebar__tools siyuan-footnote-sidebar__settings-box" role="group" aria-label="统一脚注格式">
             <div class="siyuan-footnote-sidebar__section-title">格式整理</div>
@@ -306,6 +311,10 @@ export class FootnoteSidebar {
         this.renumber = element.querySelector('[data-renumber]');
         this.jumpStyle = element.querySelector('[data-jump-style]');
         this.liveRefresh = element.querySelector('[data-live-refresh]');
+        this.panelAutoRefresh = element.querySelector('[data-panel-auto-refresh]');
+        this.refreshButton = element.querySelector('[data-action="refresh"]');
+        this.setPanelAutoRefresh(actions.panelAutoRefresh?.() ?? true);
+        this.panelAutoRefresh.addEventListener("change", () => actions.setPanelAutoRefresh?.(this.panelAutoRefresh.checked));
         this.setPreferences(actions.preferences?.() || DEFAULT_PREFERENCES);
         this.setLiveRefresh(actions.liveRefresh?.() ?? true);
         this.liveRefresh.addEventListener("change", () => {
@@ -416,6 +425,12 @@ export class FootnoteSidebar {
     }
 
     setLiveRefresh(enabled: boolean) {this.liveRefresh.checked = enabled; this.updateFormatOptions();}
+    setPanelAutoRefresh(enabled: boolean) {this.panelAutoRefresh.checked = enabled;}
+    setRefreshing(refreshing: boolean) {
+        this.refreshButton.disabled = refreshing;
+        this.refreshButton.setAttribute("aria-busy", String(refreshing));
+        this.refreshButton.title = refreshing ? "正在刷新脚注…" : "刷新脚注面板";
+    }
 
     private renderAudit() {
         const audit = this.element.querySelector<HTMLElement>(".siyuan-footnote-sidebar__audit");
@@ -428,7 +443,6 @@ export class FootnoteSidebar {
     private updateFormatOptions() {
         const text = this.format.value === "text";
         this.element.querySelector<HTMLElement>(".siyuan-footnote-sidebar__display").hidden = !text;
-        this.element.querySelector<HTMLElement>('[data-action="refresh"]').hidden = !text || (this.liveRefresh?.checked ?? true);
         this.blockLabel.disabled = this.format.value === "text";
         this.element.querySelector<HTMLElement>('[data-block-label-field]').hidden = text;
         this.element.querySelector<HTMLElement>('[data-definition-format-field]').hidden = text;

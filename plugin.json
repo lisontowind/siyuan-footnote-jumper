@@ -2,7 +2,7 @@
   "name": "siyuan-footnote-jumper",
   "author": "lisontowind",
   "url": "https://github.com/lisontowind/siyuan-footnote-jumper",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "minAppVersion": "3.7.0",
   "kernels": [
     "all"
@@ -23,7 +23,7 @@
     "zh-CN": "侧栏编辑脚注、定位被引段落，支持统一格式、连续编号和斜杠菜单插入。"
   },
   "readme": {
-    "default": "README.md",
+    "default": "README_en_US.md",
     "zh-CN": "README.md"
   },
   "funding": {

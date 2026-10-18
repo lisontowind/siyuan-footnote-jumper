@@ -147,6 +147,8 @@ function setupHost(modules) {
         setPreferences: preferences => h.jumper.setPreferences(preferences),
         liveRefresh: () => h.jumper.liveRefreshEditingBlock,
         setLiveRefresh: enabled => h.jumper.setLiveRefreshEditingBlock(enabled),
+        panelAutoRefresh: () => h.jumper?.panelAutoRefresh ?? true,
+        setPanelAutoRefresh: enabled => {h.jumper.panelAutoRefresh = enabled; h.jumper.saveSettings();},
         manualRefresh: editor => h.jumper.manualRefresh(editor.protyle),
         checkDuplicates: anchor => h.jumper.checkDuplicateDefinitions(anchor),
         setJumpEnabled: enabled => h.jumper.setEnabled(enabled),
@@ -205,6 +207,9 @@ function setupHost(modules) {
             *{box-sizing:border-box}body{margin:0;font:14px sans-serif;display:flex;height:100vh}.main{flex:1;padding:32px;overflow:auto}.main>[data-node-id]{padding:12px;line-height:1.8}#dock{width:360px;border-left:1px solid #ddd}.block__icons{display:flex;align-items:center;padding:10px;gap:8px}.block__logo{display:flex;align-items:center;gap:5px;font-weight:600}svg{width:16px;height:16px}.fn__flex-1{flex:1}.block__icon{cursor:pointer}.b3-button{padding:6px 10px;border:1px solid #a2b2f4;color:#4563cf;background:#fff;border-radius:4px}.b3-select{padding:4px}.protyle-wysiwyg [contenteditable]{outline:none}.protyle-attr{display:none}
         </style><main class="main protyle-wysiwyg"></main><aside id="dock"></aside></html>`);
         await page.addStyleTag({content: fs.readFileSync(path.join(workspace, "dist", "index.css"), "utf8")});
+        // Host styles can hide toolbar buttons until hover, fill SVG paths, and
+        // add native checkbox padding. The plugin header must stay self-contained.
+        await page.addStyleTag({content: `.block__icons:not(:hover) .block__icon{opacity:0;visibility:hidden} svg{fill:currentColor} input[type="checkbox"]{padding:2px;vertical-align:baseline}`});
         await page.evaluate(setupHost, modules);
         assert.equal(await page.locator('[data-superscript]').isChecked(), true);
         const assertMatchingCards = async () => {
@@ -712,8 +717,57 @@ function setupHost(modules) {
         await page.locator('[data-live-refresh]').check();
         await page.getByRole("tab", {name: "设置", exact: true}).click();
         await page.getByRole('combobox', {name: '目标脚注写法'}).selectOption('block');
-        assert.equal(await page.locator('[data-action="refresh"]').isVisible(), false);
+        assert.equal(await page.locator('[data-action="refresh"]').isVisible(), true);
         assert.equal(await page.locator('.main .siyuan-footnote-ref').count(), 0);
+
+        const assertHeaderControls = async () => {
+            await page.mouse.move(1, 1);
+            assert.equal(await page.evaluate(() => {
+                const header = document.querySelector('#dock > .block__icons');
+                const controls = [header.querySelector('.siyuan-footnote-sidebar__auto-refresh'),
+                    header.querySelector('[data-action="refresh"]'), header.querySelector('[data-type="min"]')];
+                const bounds = header.getBoundingClientRect();
+                const toggle = header.querySelector('[data-panel-auto-refresh]');
+                const text = header.querySelector('.siyuan-footnote-sidebar__auto-refresh > span');
+                const centerY = element => {const rect = element.getBoundingClientRect(); return rect.top + rect.height / 2;};
+                const thumb = getComputedStyle(toggle, '::before');
+                const thumbY = toggle.getBoundingClientRect().top + parseFloat(getComputedStyle(toggle).borderTopWidth)
+                    + parseFloat(thumb.top) + new DOMMatrix(thumb.transform).m42 + parseFloat(thumb.height) / 2;
+                return controls.every((control, index) => {
+                    const rect = control.getBoundingClientRect();
+                    const style = getComputedStyle(control);
+                    return rect.width > 0 && rect.left >= bounds.left && rect.right <= bounds.right
+                        && style.visibility === 'visible' && Number(style.opacity) >= .5
+                        && Math.abs(centerY(control) - centerY(toggle)) < 1
+                        && (index === 0 || rect.left >= controls[index - 1].getBoundingClientRect().right);
+                }) && header.scrollWidth <= header.clientWidth
+                    && Math.abs(centerY(text) - centerY(toggle)) < 1 && Math.abs(thumbY - centerY(toggle)) < 1
+                    && getComputedStyle(toggle).padding === '0px'
+                    && controls.slice(1).every(button => getComputedStyle(button.querySelector('svg')).fill === 'none');
+            }), true, 'Header controls must remain visible without hover, aligned and unfilled under host CSS');
+            for (const name of ['脚注', '设置']) {
+                await page.getByRole('tab', {name, exact: true}).click();
+                assert.equal(await page.getByRole('switch', {name: '面板自动刷新', exact: true}).isVisible(), true);
+                assert.equal(await page.getByRole('button', {name: '刷新脚注面板', exact: true}).isVisible(), true);
+                assert.equal(await page.getByRole('button', {name: '关闭脚注侧栏', exact: true}).isVisible(), true);
+            }
+        };
+        for (const width of [260, 360]) {
+            await page.locator('#dock').evaluate((element, width) => {element.style.width = width + 'px';}, width);
+            await assertHeaderControls();
+        }
+        await page.getByRole('switch', {name: '面板自动刷新', exact: true}).focus();
+        await page.keyboard.press('Space');
+        assert.equal(await page.getByRole('switch', {name: '面板自动刷新', exact: true}).isChecked(), false);
+        assert.equal(await page.evaluate(() => h.savedSettings.at(-1).panelAutoRefresh), false);
+        await page.mouse.move(1, 1);
+        await page.locator('#dock > .block__icons').screenshot({path: path.join(artifacts, 'refresh-header-off.png')});
+        await page.keyboard.press('Tab');
+        assert.equal(await page.getByRole('button', {name: '刷新脚注面板', exact: true}).evaluate(element => element === document.activeElement), true);
+        await page.getByRole('switch', {name: '面板自动刷新', exact: true}).check();
+        await page.getByRole('button', {name: '刷新脚注面板', exact: true}).waitFor({state: 'visible'});
+        await page.locator('#dock > .block__icons').screenshot({path: path.join(artifacts, 'refresh-header-light.png')});
+        console.log('Refresh toolbar passed: independent persisted switch, keyboard control and both tabs at 260px/360px.');
 
         // Closing releases the native editor; reopening restores the selection.
         await page.evaluate(async () => {
@@ -948,6 +1002,12 @@ function setupHost(modules) {
             document.documentElement.style.setProperty("--b3-border-color", "#424b5b");
         });
         await assertMatchingCards();
+        await assertHeaderControls();
+        await page.locator('#dock').evaluate(element => {element.style.width = '260px';});
+        await assertHeaderControls();
+        await page.locator('#dock > .block__icons').screenshot({path: path.join(artifacts, 'refresh-header-dark.png')});
+        await page.locator('#dock').evaluate(element => {element.style.width = '100%';});
+        await page.getByRole('tab', {name: '脚注', exact: true}).click();
         await page.screenshot({path: path.join(artifacts, "sidebar-mobile-dark.png"), animations: "disabled"});
         assert.equal(await page.evaluate(() => document.querySelector("#dock").scrollWidth > 390), false);
         await page.evaluate(() => {

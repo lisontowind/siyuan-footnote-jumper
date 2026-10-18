@@ -482,7 +482,8 @@ test("settings migrate old toggles, validate stored preferences, and restore mod
     await plugin.loadSettings();
     assert.equal(plugin.preferences.format, 'block'); assert.equal(plugin.enabled, false);
     assert.equal(plugin.jumpStyleEnabled, false); assert.equal(plugin.liveRefreshEditingBlock, false);
-    plugin.loadData = async () => ({enabled: true, liveRefreshEditingBlock: true,
+    assert.equal(plugin.panelAutoRefresh, true);
+    plugin.loadData = async () => ({enabled: true, liveRefreshEditingBlock: true, panelAutoRefresh: false,
         preferences: {format: 'text', definitionFormat: 'literal', blockLabel: 'brackets', renumber: false, superscript: false}});
     await plugin.loadSettings(); assert.equal(plugin.enabled, true);
     const saved = []; plugin.saveData = async (name, value) => saved.push(value);
@@ -490,6 +491,7 @@ test("settings migrate old toggles, validate stored preferences, and restore mod
     assert.equal(plugin.enabled, false); assert.equal(plugin.jumpStyleEnabled, true);
     plugin.setPreferences({...plugin.preferences, format: 'text'});
     assert.equal(plugin.enabled, true); assert.equal(saved.at(-1).preferences.blockLabel, 'brackets');
+    assert.equal(plugin.panelAutoRefresh, false); assert.equal(saved.at(-1).panelAutoRefresh, false);
     plugin.loadData = async () => ({preferences: {format: 'invalid', definitionFormat: 'bad', superscript: 'yes'}});
     await plugin.loadSettings(); assert.equal(plugin.preferences.format, 'text'); assert.equal(plugin.preferences.superscript, false);
 });

@@ -1,6 +1,6 @@
 {
   "name": "siyuan-footnote-jumper",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "A SiYuan plugin for footnote editing, reference navigation, normalization and slash insertion.",
   "main": "index.js",
   "scripts": {

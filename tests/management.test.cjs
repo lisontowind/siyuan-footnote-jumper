@@ -27,7 +27,7 @@ function host() {
     const globals = {document, HTMLElement: window.HTMLElement, Node: window.Node};
     const definitions = compile("definitions.ts", {});
     const model = compile("document.ts", {"./definitions": definitions, "./inline": compile("inline.ts", {})}, globals);
-    const editors = [], nativeEditors = [], messages = [], confirmations = [], transactions = [], timers = new Map();
+    const editors = [], nativeEditors = [], messages = [], confirmations = [], transactions = [], requests = [], timers = new Map();
     let active, dom = "", timerId = 0, pendingRead, nextId = 0, readonly = false, selection;
     const bus = new Map();
     const hostWindow = {siyuan: {config: {readonly: false}}, Lute: {NewNodeID: () => `new-${++nextId}`},
@@ -61,7 +61,8 @@ function host() {
         },
         getActiveEditor: () => active, getAllEditor: () => editors, getFrontend: () => "desktop",
         showMessage: (text) => messages.push(text), confirm: (title, text, cb) => confirmations.push({title, text, cb}),
-        fetchSyncPost: async (url) => {
+        fetchSyncPost: async (url, args) => {
+            requests.push({url, args});
             if (url === "/api/query/sql") return {code: 0, data: [{id: "external", root_id: "other"}]};
             if (pendingRead) return pendingRead;
             return {code: 0, data: {dom}};
@@ -88,17 +89,19 @@ function host() {
         return editor;
     };
     const opens = [], changes = [];
-    let jumpEnabled = true, liveRefresh = true, preferences = {...model.DEFAULT_PREFERENCES};
+    let jumpEnabled = true, liveRefresh = true, panelAutoRefresh = true, preferences = {...model.DEFAULT_PREFERENCES};
     const manager = new managerModule.FootnoteManager(plugin, {
         jumpEnabled: () => jumpEnabled,
         preferences: () => preferences,
         setPreferences: (value) => {preferences = {...value}; manager.updatePreferences();},
         liveRefresh: () => liveRefresh,
         setLiveRefresh: (value) => {liveRefresh = value; manager.updatePreferences();},
+        panelAutoRefresh: () => panelAutoRefresh,
+        setPanelAutoRefresh: (value) => {panelAutoRefresh = value;},
         setJumpEnabled: (enabled) => {jumpEnabled = enabled; manager.updateJumpStyle(enabled);},
         navigate: async (id) => opens.push(id), tablePending: () => false, changed: (id) => changes.push(id)});
     return {document, model, manager, plugin, api, hostWindow, nativeEditors, messages, confirmations, editing,
-        transactions, timers, addEditor, opens, changes, sidebarModule, editors, dialogs,
+        transactions, requests, timers, addEditor, opens, changes, sidebarModule, editors, dialogs,
         snapshot: (html, overlays = [], ignored) => model.buildDocumentSnapshot("doc", html, overlays, ignored),
         setDOM: (html) => {dom = html;}, setActive: (editor) => {active = editor;},
         deferRead: () => {let resolve; pendingRead = new Promise((r) => {resolve = r;}); return (html) => {
@@ -952,7 +955,7 @@ test("structural undo discards stale sidebar content before reading restored lit
 test("sidebar ignores other-root events but refreshes mixed, unscoped and sync transactions", () => {
     const h = host(); h.manager.register();
     const main = h.addEditor("doc", block("body", "[^1]") + block("d", "[^1]: A"));
-    h.mount(); h.manager.captureMain(); h.timers.clear();
+    h.mount(); h.manager.captureMain(); h.timers.clear(); h.manager.timer = 0;
     const revision = h.manager.revision;
     h.emit("ws-main", {cmd: "transactions", data: {rootID: "other", doOperations: [{action: "update", id: "foreign"}]}});
     h.emit("loaded-protyle-dynamic", {protyle: {block: {rootID: "other"}}});
@@ -1401,7 +1404,186 @@ test('picker selection and create mode change the confirmation label without wri
     assert.match(h.transactions[0].forward.filter(op => op.action === 'insert').map(op => op.data).join(''), /保留草稿/);
 });
 
-test("sidebar persists mode and dependent preferences, only exposes manual refresh with live refresh off", () => {
+async function drainPanelTimers(h) {
+    for (let pass = 0; pass < 10 && h.timers.size; pass++) {
+        const timers = Array.from(h.timers.entries());
+        for (const [id, timer] of timers) {h.timers.delete(id); timer.cb();}
+        await settle();
+    }
+    assert.equal(h.timers.size, 0, 'panel refresh must settle without a polling loop');
+}
+
+function panelAuto(h, panel, enabled) {
+    const toggle = panel.querySelector('[data-panel-auto-refresh]');
+    toggle.checked = enabled;
+    toggle.dispatchEvent(new h.document.defaultView.Event('change'));
+}
+
+function hidePanel(h, panel) {
+    panel.getClientRects = () => [];
+    h.manager.updateVisibility();
+}
+
+function showPanel(h, panel) {
+    panel.getClientRects = () => [{width: 360}];
+    h.manager.updateVisibility();
+}
+
+test('closed panel never reads on edits, loading, document switches or sync; reopening reads once', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    hidePanel(h, panel);
+    editor.protyle.wysiwyg.element.dispatchEvent(new h.document.defaultView.Event('input', {bubbles: true}));
+    h.emit('ws-main', {cmd: 'syncFinish'});
+    h.emit('loaded-protyle-dynamic', {protyle: editor.protyle});
+    const other = h.addEditor('other', html); h.emit('switch-protyle', {protyle: other.protyle});
+    await h.manager.refresh(); await drainPanelTimers(h);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.manager.snapshot, undefined);
+    showPanel(h, panel); await drainPanelTimers(h);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.manager.snapshot.rootId, 'other');
+});
+
+test('manual panel mode loads on open and document switch but ignores edits and sync', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    panelAuto(h, panel, false); await drainPanelTimers(h);
+    assert.equal(h.requests.length, 1, 'initial load survives turning off auto refresh');
+    editor.protyle.wysiwyg.element.dispatchEvent(new h.document.defaultView.Event('input', {bubbles: true}));
+    h.emit('ws-main', {cmd: 'syncFinish'}); h.emit('loaded-protyle-dynamic', {protyle: editor.protyle});
+    await drainPanelTimers(h); assert.equal(h.requests.length, 1);
+    const other = h.addEditor('other', html); h.emit('switch-protyle', {protyle: other.protyle});
+    await drainPanelTimers(h); assert.equal(h.requests.length, 2);
+    h.emit('switch-protyle', {protyle: other.protyle}); await drainPanelTimers(h);
+    assert.equal(h.requests.length, 2, 'duplicate switch events must not reload an unchanged document');
+    hidePanel(h, panel); showPanel(h, panel); await drainPanelTimers(h);
+    assert.equal(h.requests.length, 3);
+    assert.equal(h.mount().querySelector('[data-panel-auto-refresh]').checked, false);
+});
+
+test('header switch cancels queued automatic reads and enabling it refreshes immediately', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    await drainPanelTimers(h);
+    editor.protyle.wysiwyg.element.dispatchEvent(new h.document.defaultView.Event('input', {bubbles: true}));
+    assert.equal(h.timers.get(h.manager.timer).delay, 1000);
+    panelAuto(h, panel, false); await drainPanelTimers(h); assert.equal(h.requests.length, 1);
+    panelAuto(h, panel, true); assert.equal(h.timers.get(h.manager.timer).delay, 0);
+    await drainPanelTimers(h); assert.equal(h.requests.length, 2);
+});
+
+test('manual refresh updates the complete panel, waits for body refresh, and recovers after failure', async () => {
+    const h = host(), html = block('body', '正文 [^1]') + block('d', '[^1]: 内容');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    panelAuto(h, panel, false); await drainPanelTimers(h);
+    const button = panel.querySelector('[data-action="refresh"]');
+    let release, bodyRefreshes = 0;
+    h.manager.host.manualRefresh = () => {bodyRefreshes++; return new Promise(resolve => {release = resolve;});};
+    const updated = block('body', '正文 [^1] 再引 [^1]') + block('d', '[^1]: 更新内容');
+    h.setDOM(updated); editor.protyle.wysiwyg.element.innerHTML = updated;
+    h.manager.sidebar.protyle.wysiwyg.element.innerHTML = block('d', '[^1]: 更新内容');
+    button.click(); button.click();
+    assert.equal(bodyRefreshes, 1); assert.equal(button.disabled, true); assert.equal(button.getAttribute('aria-busy'), 'true');
+    assert.equal(h.requests.length, 1, 'panel read must wait for the body refresh');
+    release(); await settle();
+    assert.equal(h.requests.length, 2); assert.equal(button.disabled, false);
+    assert.equal(h.manager.snapshot.notes[0].references.length, 2);
+    assert.match(panel.querySelector('[data-note-key="d"]').textContent, /更新内容/);
+    assert.equal(panel.querySelector('.siyuan-footnote-sidebar__audit').hidden, false);
+    h.manager.host.manualRefresh = () => {throw Error('刷新失败');};
+    button.click(); await settle(); assert.equal(button.disabled, false); assert.match(h.messages.at(-1), /刷新失败/);
+    h.manager.host.manualRefresh = undefined; button.click(); await settle(); assert.equal(h.requests.length, 3);
+});
+
+test('manual refresh and initial loading defer through composition and cancel when hidden', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    panelAuto(h, panel, false); h.manager.composing = true;
+    const button = panel.querySelector('[data-action="refresh"]'); button.click();
+    const timer = h.timers.get(h.manager.timer); h.timers.delete(h.manager.timer); timer.cb(); await settle();
+    assert.equal(h.requests.length, 0); assert.equal(button.disabled, true);
+    h.document.dispatchEvent(new h.document.defaultView.Event('compositionend')); await settle(); await drainPanelTimers(h);
+    assert.equal(h.requests.length, 1); assert.equal(button.disabled, false);
+    h.manager.composing = true; button.click(); hidePanel(h, panel);
+    h.document.dispatchEvent(new h.document.defaultView.Event('compositionend')); await settle(); await drainPanelTimers(h);
+    assert.equal(h.requests.length, 1); assert.equal(button.disabled, false);
+});
+
+test('hiding an in-flight panel read discards parsing, cache updates and reruns', async () => {
+    const h = host(), html = block('d', '[^1]: 旧内容');
+    h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    const finish = h.deferRead(); const loading = h.manager.refresh();
+    h.emit('ws-main', {cmd: 'syncFinish'}); hidePanel(h, panel);
+    finish(html); await loading; await drainPanelTimers(h);
+    assert.equal(h.requests.length, 1); assert.equal(h.manager.snapshot, undefined);
+    assert.equal(h.manager.previousLabels.size, 0);
+    showPanel(h, panel); await drainPanelTimers(h); assert.equal(h.requests.length, 2);
+});
+
+test('automatic refresh coalesces concurrent edits into one debounced follow-up', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); h.mount();
+    await drainPanelTimers(h);
+    const finish = h.deferRead(); const loading = h.manager.refresh(false);
+    for (let i = 0; i < 3; i++) editor.protyle.wysiwyg.element.dispatchEvent(new h.document.defaultView.Event('input', {bubbles: true}));
+    const duplicate = h.manager.refresh(false); finish(html); await Promise.all([loading, duplicate]);
+    assert.equal(h.requests.length, 2); assert.equal(h.timers.size, 1);
+    assert.equal(h.timers.get(h.manager.timer).delay, 1000);
+    await drainPanelTimers(h); assert.equal(h.requests.length, 3);
+});
+
+test('switching off auto refresh during an automatic read prevents its follow-up', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    const editor = h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    await drainPanelTimers(h); const finish = h.deferRead(); const loading = h.manager.refresh(false);
+    editor.protyle.wysiwyg.element.dispatchEvent(new h.document.defaultView.Event('input', {bubbles: true}));
+    panelAuto(h, panel, false); finish(html); await loading; await drainPanelTimers(h);
+    assert.equal(h.requests.length, 2);
+});
+
+test('an explicit operation refresh merged into a slow automatic read survives manual mode', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    await drainPanelTimers(h); const finish = h.deferRead(); const loading = h.manager.refresh(false);
+    h.manager.revision++;
+    // An explicit plugin operation may request fresh data while a prior read is outstanding.
+    h.manager.schedule(1000, true);
+    const timer = h.timers.get(h.manager.timer); h.timers.delete(h.manager.timer); timer.cb(); await settle();
+    panelAuto(h, panel, false); finish(html); await loading;
+    assert.equal(h.timers.size, 1); assert.equal(h.manager.timerRequired, true);
+    await drainPanelTimers(h); assert.equal(h.requests.length, 3);
+});
+
+test('manual refresh restores its button after a panel read fails and can be retried', async () => {
+    const h = host(), html = block('d', '[^1]: 内容');
+    h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+    panelAuto(h, panel, false); await drainPanelTimers(h);
+    const original = h.api.fetchSyncPost, button = panel.querySelector('[data-action="refresh"]');
+    h.api.fetchSyncPost = async () => {throw Error('读取失败');};
+    button.click(); await settle();
+    assert.equal(button.disabled, false); assert.match(panel.querySelector('[role="status"]').textContent, /读取失败/);
+    h.api.fetchSyncPost = original; button.click(); await settle();
+    assert.equal(button.disabled, false); assert.equal(h.requests.length, 2);
+});
+
+test('closing or switching documents during body refresh does not read a stale panel document', async () => {
+    for (const switchDocument of [false, true]) {
+        const h = host(), html = block('d', '[^1]: 内容');
+        h.addEditor('doc', html); h.setDOM(html); h.manager.register(); const panel = h.mount();
+        panelAuto(h, panel, false); await drainPanelTimers(h);
+        let release; h.manager.host.manualRefresh = () => new Promise(resolve => {release = resolve;});
+        panel.querySelector('[data-action="refresh"]').click();
+        if (switchDocument) {
+            const other = h.addEditor('other', html); h.emit('switch-protyle', {protyle: other.protyle});
+        } else hidePanel(h, panel);
+        release(); await settle(); await drainPanelTimers(h);
+        assert.equal(h.requests.length, switchDocument ? 2 : 1);
+        if (switchDocument) assert.equal(h.manager.snapshot.rootId, 'other');
+    }
+});
+
+test("sidebar persists preferences and always exposes header refresh independently of live matching", () => {
     const h = host(); h.addEditor("doc", block("body", "正文")); h.manager.register(); const panel = h.mount();
     const select = (selector, value) => {
         panel.querySelector(`${selector} option[value="${value}"]`).selected = true;
@@ -1411,7 +1593,9 @@ test("sidebar persists mode and dependent preferences, only exposes manual refre
     assert.equal(panel.querySelector('.siyuan-footnote-sidebar__display').hidden, true);
     select('select', 'text');
     assert.equal(panel.querySelector('.siyuan-footnote-sidebar__display').hidden, false);
-    assert.equal(panel.querySelector('[data-action="refresh"]').hidden, true);
+    assert.equal(panel.querySelector('[data-action="refresh"]').hidden, false);
+    assert.ok(panel.querySelector('.block__icons [data-action="refresh"]'));
+    assert.equal(panel.querySelectorAll('[data-action="refresh"]').length, 1);
     panel.querySelector('[data-live-refresh]').checked = false;
     panel.querySelector('[data-live-refresh]').dispatchEvent(new h.document.defaultView.Event("change"));
     assert.equal(panel.querySelector('[data-action="refresh"]').hidden, false);
