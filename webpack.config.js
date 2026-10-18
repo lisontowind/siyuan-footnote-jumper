@@ -23,7 +23,6 @@ module.exports = (env, argv) => {
             patterns: [
                 {from: "README.md", to: "./dist/"},
                 {from: "README_en_US.md", to: "./dist/"},
-                {from: "assets/guide/en_US", to: "./dist/assets/guide/en_US/"},
                 {from: "CHANGELOG.md", to: "./dist/"},
                 {from: "LICENSE", to: "./dist/"},
                 {from: "plugin.json", to: "./dist/"},

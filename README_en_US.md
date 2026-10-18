@@ -8,7 +8,7 @@ The plugin interface currently uses Chinese. The illustrations use English annot
 
 ## Quick start
 
-![Insert dialog: search for an existing footnote, or enter content and create a new one](assets/guide/en_US/01-insert.png)
+![Insert dialog: search for an existing footnote, or enter content and create a new one](https://raw.githubusercontent.com/lisontowind/siyuan-footnote-jumper/v0.2.11/assets/guide/en_US/01-insert.png)
 
 1. Enable the plugin and open the document where you want to add footnotes.
 2. Type `/` in a body paragraph or heading, search for “脚注”, “footnote”, or “jz”, and choose **Insert footnote (插入脚注)**.
@@ -83,7 +83,7 @@ The sidebar has **Footnotes (脚注)** and **Settings (设置)** panels. Footnot
 
 The footnote list initially loads 40 items, and referring paragraphs initially load 30. Scrolling near the top or bottom automatically loads adjacent batches without a load button. Counts and full-document format checks always cover the whole document. Refreshing reuses unchanged list items and preserves the scroll position and original block editor. Switching the main document updates the panel; editing in the sidebar does not change which document is being managed.
 
-![Footnotes panel: number lookup, footnote list and reference counts, original block editor, and referring paragraphs](assets/guide/en_US/02-sidebar.png)
+![Footnotes panel: number lookup, footnote list and reference counts, original block editor, and referring paragraphs](https://raw.githubusercontent.com/lisontowind/siyuan-footnote-jumper/v0.2.11/assets/guide/en_US/02-sidebar.png)
 
 The current document appears at the top. Use Footnotes to find, edit, and navigate; use Settings to save preferences, normalize formats, and check issues.
 
@@ -103,7 +103,7 @@ The panel shows guidance when no document is open or the document has no footnot
 
 ### Save preferences and check formats in Settings
 
-![Settings panel: reference style, definition format, block reference labels, sequential numbering, native superscript, normalization, and document checks](assets/guide/en_US/07-settings.png)
+![Settings panel: reference style, definition format, block reference labels, sequential numbering, native superscript, normalization, and document checks](https://raw.githubusercontent.com/lisontowind/siyuan-footnote-jumper/v0.2.11/assets/guide/en_US/07-settings.png)
 
 - **Reference style (引用写法):** Saved for future insertions. To convert existing content after changing the preference, click Normalize format and confirm.
 - **Format normalization (格式整理):** For static block references, choose **Definition format (定义格式)** and **Block reference label (块引编号)**, then optionally enable **Sequential numbering (连续编号)** and **Superscript references (引用使用上标)**. Text markers always use explicit definitions.
@@ -113,7 +113,7 @@ The panel shows guidance when no document is open or the document has no footnot
 
 ## Preview, jump, and return to the body
 
-![Text-marker reading flow: hover to preview, click to locate a footnote, and return to the original body reference](assets/guide/en_US/03-navigation.png)
+![Text-marker reading flow: hover to preview, click to locate a footnote, and return to the original body reference](https://raw.githubusercontent.com/lisontowind/siyuan-footnote-jumper/v0.2.11/assets/guide/en_US/03-navigation.png)
 
 With Footnote navigation styling enabled, body text markers appear as clickable superscripts. Hover to preview the footnote or click to locate its definition. Footnotes at the unloaded end of a long document can be previewed and reached without scrolling to the end first.
 
@@ -141,7 +141,7 @@ Static block reference mode uses SiYuan’s native interactions and hides text-m
 
 Conversion preserves inline formatting in references, including bold, italic, and color. Markers already using native superscript do not receive an additional layer of reduced size or raised positioning. Text markers still support navigation and previews; disabling Footnote navigation styling also preserves saved native superscripts.
 
-![Before and after normalization: numbering follows first body reference, repeated references share a number, and unreferenced definitions go last](assets/guide/en_US/04-normalize.png)
+![Before and after normalization: numbering follows first body reference, repeated references share a number, and unreferenced definitions go last](https://raw.githubusercontent.com/lisontowind/siyuan-footnote-jumper/v0.2.11/assets/guide/en_US/04-normalize.png)
 
 In the illustration, footnote B is referenced first, so `[^8]` becomes a `[^1]` block reference. Footnote A follows and becomes `[^2]`. The second reference to B still uses `[^1]`, and unreferenced definitions are placed last.
 
@@ -151,7 +151,7 @@ Normalization preserves rich footnote content such as bold text and links, as we
 
 After reordering footnotes, deleting list items, or changing the list’s starting number, Settings may report that the numbers have changed. Click **Refresh numbers (刷新序号)** and confirm to update body labels to the current footnote numbers while preserving reference targets and list order.
 
-![Before and after refreshing numbers: A moves from list item 1 to 2, and its body label updates while the target and list order stay the same](assets/guide/en_US/05-refresh.png)
+![Before and after refreshing numbers: A moves from list item 1 to 2, and its body label updates while the target and list order stay the same](https://raw.githubusercontent.com/lisontowind/siyuan-footnote-jumper/v0.2.11/assets/guide/en_US/05-refresh.png)
 
 In the illustration, A moves to the second list item. Its body block reference still targets A, but the displayed label needs to change from `[^1]` to `[^2]`. Refresh numbers updates that label without moving A back to the first item.
 
@@ -179,7 +179,7 @@ Duplicate numbers have a red double underline and a conflict hint on hover. Clic
 
 Full-document normalization automatically ends the editing selection inside a table and waits for SiYuan to save pending input before continuing. It uses the complete saved table content so unloaded rows are included. If saving fails, or an older SiYuan version cannot confirm completion, you are prompted to retry.
 
-![Normalization after table editing: finish editing, wait for native saving, read the complete document, check and confirm; stop and retry if saving fails](assets/guide/en_US/06-save.png)
+![Normalization after table editing: finish editing, wait for native saving, read the complete document, check and confirm; stop and retry if saving fails](https://raw.githubusercontent.com/lisontowind/siyuan-footnote-jumper/v0.2.11/assets/guide/en_US/06-save.png)
 
 Slash insertion uses a local transaction. Unsaved unrelated blocks do not block its dialog or insertion. Full-document normalization normally does not require manually leaving a table. If saving has not finished, wait for the current edit to save and retry; finish Chinese input-method composition first. If you edit content or switch documents while confirming normalization or block reference conversion, the plugin must check again and ask for confirmation again.
 
@@ -197,8 +197,8 @@ Code, embedded-document content, ordinary block references, and references to ot
 
 ## Installation and updates
 
-Extract the release archive `package.zip` into `data/plugins/siyuan-footnote-jumper/` in your SiYuan workspace. When updating, overwrite the plugin files while retaining plugin settings. Restart SiYuan and enable **Footnote Jumper (脚注跳转)** in plugin settings. The current version is **0.2.11**.
+Extract the release archive `package.zip` into `data/plugins/siyuan-footnote-jumper/` in your SiYuan workspace. When updating, overwrite the plugin files while retaining plugin settings. Restart SiYuan and enable **Footnote Jumper (脚注跳转)** in plugin settings. The current version is **0.2.12**.
 
-This version adds an independent panel Auto refresh toggle and a refresh button available in both panels and reference modes. Closing the sidebar stops full-document reads for the panel. Toolbar visibility and switch alignment are improved. Complete English documentation and seven English illustrations are now available, with links between the English and Chinese guides.
+This version reduces the release package size by loading English guide images from fixed GitHub URLs, just like the Chinese guide. Plugin behavior is unchanged from v0.2.11.
 
-The illustrated guide includes seven English images covering insertion, the Footnotes panel, Settings, preview and navigation, normalization, number refresh, and table saving. Images are included in the release package under `assets/guide/en_US/` and can be viewed locally with this README.
+The illustrated guide includes seven English images covering insertion, the Footnotes panel, Settings, preview and navigation, normalization, number refresh, and table saving. Images use public GitHub URLs pinned to v0.2.11, where these illustrations were published. They are not bundled with the plugin and require an internet connection to view.
